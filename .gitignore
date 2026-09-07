@@ -1,0 +1,19 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+frontend/dist/
+data/uploads/*
+!data/uploads/.gitkeep
+data/database/*
+!data/database/.gitkeep
+data/exports/*
+!data/exports/.gitkeep
+
+# macOS 系统文件
+.DS_Store
+
+# 本地测试素材与测试结果，不同步到仓库
+test/
+

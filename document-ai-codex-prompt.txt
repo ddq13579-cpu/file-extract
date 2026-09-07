@@ -1,0 +1,1292 @@
+# 文档智能结构化系统 V1 - Codex 开发指令
+
+请从当前目录开始，重新构建一个全新的 Docker 化项目。
+
+项目目标：
+
+用户通过网页拖入一个文件或文件夹，系统自动扫描其中的 PDF 和图片文件；PDF 优先直接提取文字，图片使用本地 PaddleOCR；得到原始文字后，将文字 + 用户定义的提取模板发送给 Google Gemini API；Gemini 严格按照模板返回 JSON；JSON 保存到 SQLite 数据库；最终可以查看结果并导出 Excel。
+
+核心链路：
+
+网页拖入文件/文件夹
+→ 文件扫描
+→ PDF → PyMuPDF
+→ 图片 → PaddleOCR
+→ 原始文字
+→ Google Gemini API
+→ 结构化 JSON
+→ SQLite
+→ Excel
+
+本项目不是 CRM，也不要加入销售管理、佣金、客户管理等业务功能。
+
+
+==================================================
+一、技术栈
+==================================================
+
+Frontend:
+- Vue 3
+- Vite
+- TypeScript
+- Element Plus
+- Axios
+
+生产环境：
+- Vue 使用 Vite build
+- 构建后的 dist 由 Nginx 提供
+- 不使用 Apache
+
+Backend:
+- Python
+- FastAPI
+- SQLAlchemy
+- SQLite
+- Pydantic
+
+Document:
+- PyMuPDF
+- Pillow
+- PaddleOCR
+
+AI:
+- Google Gemini API
+- 使用 Google 官方 Python SDK
+- API Key 从环境变量读取
+- 不要把 API Key 写入代码
+
+Excel:
+- openpyxl
+
+Deployment:
+- Docker Compose
+
+
+==================================================
+二、最终 Docker 架构
+==================================================
+
+必须使用以下运行服务：
+
+1. nginx
+2. backend
+3. worker
+
+Vue 前端不需要单独运行 Node/Vite 开发服务器。
+
+生产架构：
+
+浏览器
+  ↓
+Nginx
+  ├── Vue 静态文件
+  └── /api → FastAPI
+                 ↓
+              SQLite
+                 ↓
+              Worker
+              ├── PyMuPDF
+              ├── PaddleOCR
+              └── Gemini API
+
+Nginx 要负责：
+- 提供 Vue dist 静态文件
+- 将 /api/ 请求反向代理到 backend
+- 可以配置上传大小限制
+- 为以后 HTTPS 留出配置空间
+
+浏览器上传文件的路径：
+
+浏览器
+→ Nginx
+→ FastAPI
+→ /data/uploads
+
+不要让浏览器直接访问 SQLite、worker 或内部文件路径。
+
+不要让 Nginx 直接负责保存上传文件。
+
+不要使用 Apache。
+
+
+==================================================
+三、项目目录
+==================================================
+
+建议：
+
+document-ai/
+├── docker-compose.yml
+├── .env.example
+├── .gitignore
+├── README.md
+│
+├── nginx/
+│   ├── Dockerfile
+│   └── nginx.conf
+│
+├── frontend/
+│   ├── Dockerfile
+│   ├── package.json
+│   ├── vite.config.ts
+│   ├── src/
+│   └── ...
+│
+├── backend/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── app/
+│       ├── main.py
+│       ├── config.py
+│       ├── database.py
+│       ├── models/
+│       ├── schemas/
+│       ├── routers/
+│       └── services/
+│
+├── worker/
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── app/
+│       ├── main.py
+│       ├── config.py
+│       ├── services/
+│       │   ├── pdf_extractor.py
+│       │   ├── ocr/
+│       │   │   └── paddleocr_provider.py
+│       │   └── ai/
+│       │       ├── base.py
+│       │       └── gemini.py
+│       └── ...
+│
+└── data/
+    ├── uploads/
+    ├── database/
+    └── exports/
+
+实际结构可以合理调整，但必须保持 frontend、backend、worker、nginx 职责清晰。
+
+
+==================================================
+四、环境变量
+==================================================
+
+创建：
+
+.env.example
+
+至少包含：
+
+GOOGLE_API_KEY=
+GOOGLE_MODEL=
+DATABASE_URL=sqlite:///data/database/app.db
+UPLOAD_DIR=/data/uploads
+EXPORT_DIR=/data/exports
+
+不要提交真实 API Key。
+
+.env 必须加入 .gitignore。
+
+如果 GOOGLE_MODEL 需要默认值，可以提供合理默认值，但允许 .env 覆盖。
+
+
+==================================================
+五、网页首页
+==================================================
+
+首页实现：
+
+文档智能整理系统
+
+[选择提取模板 ▼]
+
+┌──────────────────────────────────┐
+│                                  │
+│      将文件或文件夹拖到这里       │
+│                                  │
+│      支持 PDF / JPG / PNG        │
+│                                  │
+└──────────────────────────────────┘
+
+[开始处理]
+
+必须支持：
+1. 点击选择文件
+2. 拖入文件
+3. 尽可能支持拖入文件夹
+4. 保留文件夹相对路径
+5. 显示已选择的文件数量
+6. 显示上传/处理状态
+
+例如：
+
+2026-09-04/
+├── 张三/
+│   ├── 001.pdf
+│   └── 002.jpg
+├── 李四/
+│   └── 003.jpg
+
+数据库保存：
+
+folder_level_1 = 张三
+filename = 001.pdf
+relative_path = 张三/001.pdf
+
+不要把“张三”硬编码成业务员。
+
+目录只保存为原始分类信息。
+
+
+==================================================
+六、支持的文件类型
+==================================================
+
+支持：
+
+.pdf
+.jpg
+.jpeg
+.png
+.webp
+.bmp
+.tif
+.tiff
+.heic
+
+无法处理的文件：
+- 跳过
+- 不影响其他文件
+- status = skipped
+- 写入日志
+
+macOS 文件直接忽略：
+
+.DS_Store
+__MACOSX
+以及其他明显的系统元数据文件。
+
+
+==================================================
+七、数据库
+==================================================
+
+使用 SQLite + SQLAlchemy。
+
+至少建立：
+
+documents
+templates
+template_fields
+ocr_results
+records
+processing_logs
+
+
+------------------------------
+documents
+------------------------------
+
+id
+filename
+relative_path
+file_path
+file_type
+mime_type
+file_size
+sha256
+folder_level_1
+folder_level_2
+status
+error_message
+created_at
+updated_at
+
+status 至少：
+
+pending
+processing
+ocr_completed
+ai_processing
+completed
+failed
+skipped
+
+
+------------------------------
+templates
+------------------------------
+
+id
+name
+description
+created_at
+updated_at
+
+
+------------------------------
+template_fields
+------------------------------
+
+id
+template_id
+field_name
+field_key
+field_type
+description
+required
+sort_order
+created_at
+
+field_type V1：
+
+text
+number
+date
+boolean
+
+
+例如：
+
+模板：学平险
+
+字段：
+被保险人姓名
+insured_name
+text
+required = true
+
+被保险人身份证
+insured_id
+text
+required = true
+
+学校
+school
+text
+required = true
+
+保费
+premium
+number
+required = true
+
+保险开始日期
+start_date
+date
+required = true
+
+
+------------------------------
+ocr_results
+------------------------------
+
+id
+document_id
+engine
+raw_text
+created_at
+
+必须保存完整原始 OCR/PDF 提取文字。
+
+engine 示例：
+
+pymupdf
+paddleocr
+
+
+------------------------------
+records
+------------------------------
+
+id
+document_id
+template_id
+json_data
+status
+created_at
+updated_at
+
+json_data 保存最终结构化 JSON。
+
+
+------------------------------
+processing_logs
+------------------------------
+
+id
+document_id
+stage
+level
+message
+created_at
+
+用于记录处理过程和错误。
+
+
+==================================================
+八、PDF处理
+==================================================
+
+PDF 默认不做 OCR。
+
+流程：
+
+PDF
+→ PyMuPDF
+→ 提取所有页面文字
+→ 合并文字
+→ 保存 ocr_results
+→ Gemini
+→ JSON
+→ records
+
+一个多页 PDF 是一个 document。
+
+例如一个 28 页保险 PDF：
+
+1 个 document
+1 条 record
+
+不是 28 条记录。
+
+如果 PDF 没有有效文字，第一版可以：
+- 标记为 failed 或需要 OCR
+- 明确记录原因
+- 不要偷偷把 PDF 当成普通图片处理
+
+后续版本再增加：
+扫描 PDF → 页面转图片 → PaddleOCR。
+
+
+==================================================
+九、图片 OCR
+==================================================
+
+图片：
+
+JPG / PNG / WEBP / BMP / TIFF / HEIC
+
+统一：
+
+图片
+→ PaddleOCR
+→ raw_text
+→ 保存 ocr_results
+→ Gemini
+→ JSON
+
+PaddleOCR 必须本地运行。
+
+不要调用第三方 OCR API。
+
+不要把原始图片发送给 Google Gemini 做 OCR。
+
+Google Gemini 在 V1 只负责处理：
+- PDF 提取出来的文字
+- PaddleOCR 提取出来的文字
+
+
+==================================================
+十、PaddleOCR
+==================================================
+
+PaddleOCR 安装在 worker 容器。
+
+V1 使用 CPU。
+
+不需要：
+- GPU
+- CUDA
+
+要求：
+- 中文识别
+- OCR 模型尽量只初始化一次
+- 不要每处理一张图片就重新加载模型
+
+请根据当前稳定版本正确使用 PaddleOCR API。
+
+如果 PaddleOCR 不同版本 API 有差异，请选择当前可正常运行的稳定版本，不要使用已经废弃的接口。
+
+如果 HEIC 依赖额外系统库，请正确加入 Docker 镜像。
+
+
+==================================================
+十一、AI：Google Gemini
+==================================================
+
+AI 负责：
+
+根据用户定义的模板，从原始文字中提取对应字段。
+
+AI 不负责 OCR。
+
+例如：
+
+原始文字：
+
+学生幼儿个人意外保险单
+
+投保人姓名/名称：王兴芳
+投保人证件号码：410329197407151749
+被保险人姓名/名称：屈文阳
+被保险人证件号码：410329201307260226
+学校：伊川县实验中学
+年级：八年级
+保险方案名称：2026洛阳-学平险-伊川-非幼儿6-22岁
+保险单号：P2601026410329160000026186
+保险费合计：¥100.00
+保险期间：2026-09-04 00:00:00 至 2027-09-03 23:59:59
+销售渠道名称：朱子良
+
+模板字段：
+
+insured_name
+insured_id
+school
+grade
+policy_number
+premium
+start_date
+end_date
+sales_channel
+
+AI 输出：
+
+{
+  "insured_name": "屈文阳",
+  "insured_id": "410329201307260226",
+  "school": "伊川县实验中学",
+  "grade": "八年级",
+  "policy_number": "P2601026410329160000026186",
+  "premium": 100,
+  "start_date": "2026-09-04",
+  "end_date": "2027-09-03",
+  "sales_channel": "朱子良"
+}
+
+
+==================================================
+十二、Gemini严格结构化输出
+==================================================
+
+不要把模板字段写死。
+
+后端根据数据库：
+
+templates
+template_fields
+
+动态生成 Gemini 请求。
+
+要求：
+
+1. 只能输出模板定义的字段
+2. 不允许增加额外字段
+3. 找不到信息时返回 null 或空字符串
+4. 不允许编造
+5. date → YYYY-MM-DD
+6. number → 数字
+7. text → 字符串
+8. boolean → true/false
+9. 严格 JSON
+10. 不要 Markdown
+11. 不要解释文字
+
+优先使用 Gemini API 的 structured output / JSON Schema 功能。
+
+如果当前 Google 官方 SDK 支持 response schema，请使用 response schema。
+
+Gemini 返回结果必须经过 Pydantic / JSON Schema 验证后才能写入 records。
+
+
+==================================================
+十三、AI Provider抽象
+==================================================
+
+不要把 Gemini 调用散落在业务代码中。
+
+建立：
+
+services/ai/
+├── base.py
+└── gemini.py
+
+例如：
+
+class AIProvider:
+    def extract(self, text, template):
+        ...
+
+GeminiProvider 实现该接口。
+
+以后可以扩展：
+- OpenAI
+- Ollama
+- LM Studio
+- 其他 OpenAI-compatible API
+
+但 V1 只实现 Google Gemini。
+
+
+==================================================
+十四、Worker
+==================================================
+
+FastAPI 不要长时间阻塞等待 OCR + Gemini。
+
+网页点击：
+
+开始处理
+
+后端创建任务。
+
+Worker 根据数据库状态处理。
+
+流程：
+
+pending
+→ processing
+→ PDF/PaddleOCR
+→ ocr_completed
+→ ai_processing
+→ JSON validation
+→ completed
+
+失败：
+
+→ failed
+
+并写入：
+
+error_message
+
+单个文件失败不能影响其他文件。
+
+例如：
+
+001.pdf completed
+002.jpg completed
+003.jpg failed
+004.pdf completed
+
+
+==================================================
+十五、重复文件
+==================================================
+
+上传时计算 SHA-256。
+
+如果数据库已经存在相同 SHA-256：
+
+不要重新 OCR。
+
+不要重新调用 Gemini。
+
+提示：
+
+文件已经处理过。
+
+如果文件内容发生改变：
+SHA-256 改变
+→ 可以重新处理。
+
+
+==================================================
+十六、模板管理页面
+==================================================
+
+实现：
+
+模板管理
+
+可以：
+- 创建模板
+- 编辑模板
+- 删除模板
+- 添加字段
+- 编辑字段
+- 删除字段
+- 调整字段顺序
+
+字段：
+
+字段名称
+field_key
+类型
+是否必填
+字段说明
+
+例如：
+
+字段名称：
+被保险人姓名
+
+field_key：
+insured_name
+
+类型：
+text
+
+说明：
+保险单中的被保险人姓名
+
+必填：
+是
+
+field_key 必须唯一且适合 JSON key。
+
+
+==================================================
+十七、结果页面
+==================================================
+
+实现文件列表。
+
+显示：
+
+文件名
+文件类型
+来源目录
+模板
+状态
+处理时间
+
+例如：
+
+001.pdf PDF 张三 学平险 已完成
+002.jpg JPG 张三 学平险 已完成
+003.jpg JPG 李四 学平险 AI处理中
+
+点击后可以查看：
+
+原始文件
+原始文字
+结构化 JSON
+
+
+==================================================
+十八、结果编辑
+==================================================
+
+结果页面右侧显示结构化字段。
+
+例如：
+
+被保险人姓名
+[ 屈文阳 ]
+
+身份证
+[ 410329201307260226 ]
+
+学校
+[ 伊川县实验中学 ]
+
+保费
+[ 100 ]
+
+允许修改字段。
+
+点击保存：
+更新 records.json_data。
+
+
+==================================================
+十九、Excel导出
+==================================================
+
+使用 openpyxl。
+
+Excel 列来自：
+
+template_fields
+
+字段顺序按照 sort_order。
+
+建议固定列：
+
+folder_level_1
+folder_level_2
+filename
+
+然后添加模板字段。
+
+例如：
+
+来源目录
+文件名
+被保险人姓名
+被保险人身份证
+学校
+年级
+保单号
+保费
+开始日期
+结束日期
+销售渠道
+
+V1 提供：
+
+导出全部
+
+只导出：
+
+records.status = completed
+
+的数据。
+
+
+==================================================
+二十、API
+==================================================
+
+至少实现：
+
+GET    /api/templates
+POST   /api/templates
+GET    /api/templates/{id}
+PUT    /api/templates/{id}
+DELETE /api/templates/{id}
+
+POST   /api/files/upload
+POST   /api/files/process
+
+GET    /api/documents
+GET    /api/documents/{id}
+
+GET    /api/records
+GET    /api/records/{id}
+PUT    /api/records/{id}
+
+GET    /api/export/excel
+
+具体接口结构可以合理调整。
+
+
+==================================================
+二十一、文件安全
+==================================================
+
+上传文件必须保存到：
+
+/data/uploads
+
+数据库保存服务器内部路径。
+
+必须防止：
+../../
+路径穿越
+恶意文件名
+
+浏览器不能直接访问：
+- SQLite
+- worker
+- 任意服务器路径
+
+如需预览文件，必须通过受控的 FastAPI API。
+
+
+==================================================
+二十二、Nginx
+==================================================
+
+必须使用 Nginx。
+
+不要使用 Apache。
+
+Nginx：
+1. 提供 Vue dist 静态文件
+2. /api/ 反向代理到 backend
+3. 设置合理的 client_max_body_size
+4. 为以后 HTTPS 预留配置
+
+生产环境不要运行 Vite dev server。
+
+Vue：
+
+npm run build
+→ dist
+→ Nginx
+
+Nginx 示例逻辑：
+
+/       → Vue 静态文件
+/api/   → http://backend:8000/api/
+
+Vue Router 如果使用 history 模式，要正确配置 try_files。
+
+
+==================================================
+二十三、Docker Compose
+==================================================
+
+docker-compose.yml 至少：
+
+services:
+  nginx:
+    ...
+  backend:
+    ...
+  worker:
+    ...
+
+Nginx 对外暴露端口。
+
+backend 不需要直接暴露到宿主机公网，只需要被 nginx 和 worker 访问。
+
+worker 不暴露公网端口。
+
+数据持久化：
+
+./data/uploads
+./data/database
+./data/exports
+
+不要因为：
+
+docker compose down
+
+导致数据丢失。
+
+
+==================================================
+二十四、日志
+==================================================
+
+worker 至少记录：
+
+开始处理文件
+文件类型
+PDF文字提取 / PaddleOCR
+OCR完成
+OCR文字长度
+Gemini请求开始
+Gemini请求完成
+JSON验证
+数据库保存
+处理完成
+
+不要记录：
+GOOGLE_API_KEY
+
+错误信息要保存到 processing_logs。
+
+
+==================================================
+二十五、README
+==================================================
+
+README 必须写清：
+
+安装：
+
+cp .env.example .env
+
+编辑：
+
+GOOGLE_API_KEY=
+GOOGLE_MODEL=
+
+启动：
+
+docker compose up -d --build
+
+查看：
+
+docker compose ps
+
+日志：
+
+docker compose logs -f worker
+
+停止：
+
+docker compose down
+
+数据：
+
+data/uploads
+data/database
+data/exports
+
+说明 Nginx：
+- Web入口
+- /api 代理到 backend
+
+
+==================================================
+二十六、V1不要做
+==================================================
+
+不要加入：
+
+CRM
+销售团队
+佣金
+客户管理
+邮件
+微信
+复杂权限
+多租户
+Kubernetes
+GPU
+第三方 OCR
+复杂工作流
+Elasticsearch
+不必要的 Redis
+不必要的 Celery
+
+如果没有必要，不要为了“架构先进”增加复杂组件。
+
+
+==================================================
+二十七、开发顺序
+==================================================
+
+请严格按照以下阶段实施。
+
+STEP 1：
+检查当前目录。
+
+如果是空目录，创建项目。
+
+如果存在文件，不要破坏用户已有内容。
+
+STEP 2：
+创建：
+
+nginx
+frontend
+backend
+worker
+data
+
+STEP 3：
+先实现：
+
+Docker Compose
+Nginx
+Vue
+FastAPI
+SQLite
+
+确认：
+
+docker compose up -d --build
+
+三个容器正常。
+
+STEP 4：
+实现 PDF：
+
+PDF
+→ PyMuPDF
+→ raw_text
+→ SQLite
+
+STEP 5：
+实现图片：
+
+图片
+→ PaddleOCR
+→ raw_text
+→ SQLite
+
+STEP 6：
+实现模板系统。
+
+STEP 7：
+实现：
+
+raw_text
++
+template
+→ Gemini
+→ JSON
+→ Pydantic validation
+→ SQLite
+
+STEP 8：
+实现结果查看。
+
+STEP 9：
+实现结果编辑。
+
+STEP 10：
+实现 Excel。
+
+STEP 11：
+完整测试。
+
+
+==================================================
+二十八、测试
+==================================================
+
+至少测试：
+
+1. 一个正常文字 PDF
+2. 一个图片
+3. 一个包含多个文件的文件夹
+4. 中文文件名
+5. 中文文件夹名
+6. 重复文件
+7. 无效文件
+8. 多页 PDF
+9. AI 返回缺少字段
+10. AI 返回错误类型
+11. Gemini API 错误
+12. OCR 错误
+13. 单个文件失败但其他文件继续
+14. Excel 导出
+
+测试：
+
+PDF
+→ PyMuPDF
+→ Gemini
+→ JSON
+→ SQLite
+
+以及：
+
+JPG
+→ PaddleOCR
+→ Gemini
+→ JSON
+→ SQLite
+
+
+==================================================
+二十九、重要：不要硬编码业务
+==================================================
+
+代码中不要写死：
+
+保险
+学平险
+业务员
+保单
+投保人
+被保险人
+
+这些只能作为测试数据。
+
+程序本质是：
+
+通用文档
+→ 文字
+→ 用户定义模板
+→ JSON
+→ 数据库
+→ Excel
+
+用户以后可以创建任意模板。
+
+
+==================================================
+三十、第一版完成标准
+==================================================
+
+我应该能够：
+
+1. docker compose up -d --build
+
+2. 浏览器打开网页
+
+3. 创建模板：
+
+学平险
+
+4. 添加：
+
+被保险人姓名
+被保险人身份证
+学校
+年级
+班级
+保单号
+保费
+开始日期
+结束日期
+销售渠道
+
+5. 拖入：
+
+2026-09-04/
+├── 张三/
+│   ├── 001.pdf
+│   └── 002.jpg
+└── 李四/
+    └── 003.jpg
+
+6. 系统自动：
+
+001.pdf
+→ PyMuPDF
+
+002.jpg
+→ PaddleOCR
+
+003.jpg
+→ PaddleOCR
+
+7. 保存原始文字
+
+8. 调用 Google Gemini
+
+9. 返回严格 JSON
+
+10. JSON 保存 SQLite
+
+11. 网页查看结果
+
+12. 修改结果
+
+13. 导出 Excel
+
+
+==================================================
+三十一、开始开发前先汇报
+==================================================
+
+在开始大量写代码之前，先向我报告：
+
+1. 最终项目目录
+2. Docker 架构
+3. Nginx 配置方案
+4. SQLite ER 关系
+5. 文件处理流程
+6. PaddleOCR 版本和原因
+7. Google Gemini SDK/API 方式和原因
+8. Vue/Backend/Worker 的职责
+9. 你准备如何实现文件夹拖入和相对路径保存
+
+然后开始实施。
+
+不要询问已经可以自行决定的技术细节。
+
+遇到依赖版本问题，请自行选择当前稳定且实际可运行的版本，并记录在 README。
+
+最终必须实际运行：
+
+docker compose up -d --build
+
+并检查：
+
+docker compose ps
+
+确保 nginx、backend、worker 正常运行。
+
+完成后报告：
+
+- 创建/修改了哪些文件
+- 如何启动
+- Web访问地址
+- 如何配置 Gemini
+- 如何创建模板
+- 如何测试 PDF
+- 如何测试图片 OCR
+- 如何查看处理结果
+- 如何导出 Excel
+- 已知问题
