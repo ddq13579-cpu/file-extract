@@ -1,4 +1,5 @@
 .env
+.venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -16,4 +17,3 @@ data/exports/*
 
 # 本地测试素材与测试结果，不同步到仓库
 test/
-
