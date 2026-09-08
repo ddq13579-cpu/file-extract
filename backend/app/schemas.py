@@ -40,6 +40,15 @@ class TemplateOutput(TemplateInput):
     model_config = {"from_attributes": True}
 
 
+# 跨机器导入模板时，同名模板的处理策略：整体覆盖、跳过、另存为新名字。
+ConflictStrategy = Literal["update", "skip", "rename"]
+
+
+class TemplateImportInput(BaseModel):
+    templates: list[TemplateInput] = Field(min_length=1)
+    on_conflict: ConflictStrategy = "update"
+
+
 class RecordUpdate(BaseModel):
     json_data: dict[str, Any]
 

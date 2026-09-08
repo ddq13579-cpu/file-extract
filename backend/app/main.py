@@ -8,10 +8,11 @@ import uuid
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Annotated
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session, selectinload
 from openpyxl import Workbook
@@ -20,7 +21,7 @@ from openpyxl.styles import PatternFill
 from .config import AUTH_PASSWORD, AUTH_USERNAME, EXPORT_DIR, SECRET_KEY, SUPPORTED_EXTENSIONS, UPLOAD_DIR
 from .database import Base, engine, get_db
 from .models import Document, OCRResult, ProcessingLog, Record, Template, TemplateField
-from .schemas import LoginInput, RecordUpdate, TemplateInput, TemplateOutput
+from .schemas import LoginInput, RecordUpdate, TemplateImportInput, TemplateInput, TemplateOutput
 
 app = FastAPI(title="Document AI")
 
@@ -168,6 +169,129 @@ def create_template(payload: TemplateInput, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(template)
     return template
+
+
+def unique_template_name(name: str, db: Session) -> str:
+    """为 rename 策略生成一个库里还没被占用的模板名（名称列上限 120 字符）。"""
+    existing = set(db.scalars(select(Template.name)).all())
+    base = name[:110]
+    candidate = f"{base} (导入)"
+    suffix = 2
+    while candidate in existing:
+        candidate = f"{base} (导入 {suffix})"
+        suffix += 1
+    return candidate
+
+
+def template_to_dict(template: Template) -> dict:
+    """导出用的纯数据结构，格式与 scripts/export_templates.py 保持一致，两边文件可互通。"""
+    return {
+        "name": template.name,
+        "description": template.description or "",
+        "fields": [
+            {
+                "field_name": field.field_name,
+                "field_key": field.field_key,
+                "field_type": field.field_type,
+                "description": field.description or "",
+                "required": bool(field.required),
+                "extraction_type": field.extraction_type or "ai_extract",
+                "calc_rule": field.calc_rule,
+                "source_field_key": field.source_field_key,
+                "calc_params": field.calc_params,
+            }
+            for field in sorted(template.fields, key=lambda item: item.sort_order)
+        ],
+    }
+
+
+# 必须声明在 /api/templates/{template_id} 之前，否则 "export" 会被当成 template_id 解析而报 422。
+@app.get("/api/templates/export")
+def export_templates(template_id: int | None = None, db: Session = Depends(get_db)):
+    """把全部模板（或指定模板）导出为 JSON 文件，供另一台机器导入。"""
+    if template_id is None:
+        templates = db.scalars(
+            select(Template).options(selectinload(Template.fields)).order_by(Template.name)
+        ).all()
+        if not templates:
+            raise HTTPException(404, "还没有可导出的模板")
+        label = "全部模板"
+    else:
+        templates = [template_or_404(template_id, db)]
+        label = templates[0].name
+
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    payload = {
+        "version": 1,
+        "exported_at": now.isoformat(timespec="seconds"),
+        "source": "document-ai",
+        "templates": [template_to_dict(template) for template in templates],
+    }
+    stamp = now.strftime("%Y%m%d-%H%M%S")
+    safe_label = re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff-]", "_", label)
+    filename = f"templates-{safe_label}-{stamp}.json"
+    return Response(
+        content=json.dumps(payload, ensure_ascii=False, indent=2),
+        media_type="application/json; charset=utf-8",
+        headers={
+            # ASCII 兜底名 + RFC 5987 的 UTF-8 文件名，避免中文模板名在部分浏览器上乱码。
+            "Content-Disposition": f'attachment; filename="templates-{stamp}.json"; filename*=UTF-8\'\'{quote(filename)}'
+        },
+    )
+
+
+@app.post("/api/templates/import")
+def import_templates(payload: TemplateImportInput, db: Session = Depends(get_db)):
+    """从导出的 JSON 批量导入模板；整批要么全部成功，要么全部回滚。"""
+    names = [item.name.strip() for item in payload.templates]
+    duplicated = sorted({name for name in names if names.count(name) > 1})
+    if duplicated:
+        raise HTTPException(400, f"导入文件里有重复的模板名称：{'、'.join(duplicated)}")
+
+    counts = {"created": 0, "updated": 0, "renamed": 0, "skipped": 0}
+    results = []
+    try:
+        for item in payload.templates:
+            name = item.name.strip()
+            existing = db.scalar(
+                select(Template).options(selectinload(Template.fields)).where(Template.name == name)
+            )
+            if existing is None:
+                template = Template()
+                assign_template(template, item, db)
+                db.add(template)
+                db.flush()
+                counts["created"] += 1
+                results.append({"name": name, "action": "created", "template_id": template.id,
+                                "field_count": len(item.fields)})
+            elif payload.on_conflict == "skip":
+                counts["skipped"] += 1
+                results.append({"name": name, "action": "skipped", "template_id": existing.id,
+                                "field_count": len(existing.fields)})
+            elif payload.on_conflict == "rename":
+                new_name = unique_template_name(name, db)
+                template = Template()
+                assign_template(template, item.model_copy(update={"name": new_name}), db)
+                db.add(template)
+                db.flush()
+                counts["renamed"] += 1
+                results.append({"name": name, "action": "renamed", "new_name": new_name,
+                                "template_id": template.id, "field_count": len(item.fields)})
+            else:
+                # 覆盖时保留原 template.id，已关联的任务与结构化结果不会断链。
+                assign_template(existing, item, db)
+                db.flush()
+                counts["updated"] += 1
+                results.append({"name": name, "action": "updated", "template_id": existing.id,
+                                "field_count": len(item.fields)})
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as error:  # noqa: BLE001 - 导入失败必须整批回滚，并给出可读原因
+        db.rollback()
+        raise HTTPException(500, f"导入失败，已回滚，模板未发生变化：{error}") from error
+    return {**counts, "on_conflict": payload.on_conflict, "templates": results}
 
 
 @app.get("/api/templates/{template_id}", response_model=TemplateOutput)

@@ -22,6 +22,15 @@ type Document = { id: number; filename: string; relative_path: string; file_type
 type RecordItem = { id: number; document_id: number; template_id: number; status: string; json_data: Record<string, unknown>; updated_at: string };
 type ProcessingLog = { id: number; stage: string; level: string; message: string; model_name?: string; prompt_tokens?: number; candidates_tokens?: number; total_tokens?: number; attempt?: number; request_started_at?: string; request_completed_at?: string; duration_ms?: number; response_json?: string; created_at: string };
 
+type ImportItem = { name: string; description: string; fields: Field[]; exists: boolean };
+type ImportResult = {
+  created: number;
+  updated: number;
+  renamed: number;
+  skipped: number;
+  templates: { name: string; action: string; new_name?: string; template_id: number; field_count: number }[];
+};
+
 const isAuthenticated = ref(false);
 const username = ref("");
 const loginUsername = ref("");
@@ -41,6 +50,11 @@ const rawText = ref("");
 const textDialogVisible = ref(false);
 const logsDialogVisible = ref(false);
 const selectedLogs = ref<ProcessingLog[]>([]);
+const importInput = ref<HTMLInputElement>();
+const importDialogVisible = ref(false);
+const importItems = ref<ImportItem[]>([]);
+const importConflict = ref<"update" | "skip" | "rename">("update");
+const importing = ref(false);
 
 const selectedTemplate = computed(() => templates.value.find((template) => template.id === selectedTemplateId.value));
 const recordFields = computed(() => templates.value.find((template) => template.id === selectedRecord.value?.template_id)?.fields ?? []);
@@ -239,6 +253,95 @@ async function deleteTemplate(template: Template) {
     ElMessage.error(typeof detail === "string" ? detail : "删除模板失败");
   }
 }
+function pickImportFile() {
+  importInput.value?.click();
+}
+
+function exportTemplates(templateId?: number) {
+  if (!templateId && !templates.value.length) return ElMessage.warning("还没有可导出的模板");
+  const token = localStorage.getItem("token") || "";
+  const scope = templateId ? `template_id=${templateId}&` : "";
+  window.open(`/api/templates/export?${scope}token=${encodeURIComponent(token)}`, "_blank");
+}
+
+async function onImportFileChange(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  input.value = "";
+  if (!file) return;
+  try {
+    const raw = JSON.parse(await file.text()) as { templates?: unknown } | unknown[];
+    const list = Array.isArray(raw) ? raw : raw.templates;
+    if (!Array.isArray(list) || !list.length) throw new Error("文件里没有模板数据");
+    const items = list.map((entry) => {
+      const item = entry as { name?: unknown; description?: unknown; fields?: unknown };
+      const name = typeof item.name === "string" ? item.name.trim() : "";
+      if (!name) throw new Error("存在没有名称的模板");
+      return {
+        name,
+        description: typeof item.description === "string" ? item.description : "",
+        fields: Array.isArray(item.fields) ? (item.fields as Field[]) : [],
+        exists: templates.value.some((template) => template.name === name),
+      };
+    });
+    if (items.some((item) => !item.fields.length)) throw new Error("存在没有任何字段的模板，请先在源机器上补全");
+    importItems.value = items;
+    importConflict.value = "update";
+    importDialogVisible.value = true;
+  } catch (error) {
+    ElMessage.error(`解析模板文件失败：${error instanceof Error ? error.message : "JSON 格式不正确"}`);
+  }
+}
+
+function importErrorMessage(error: unknown): string {
+  const detail = error instanceof AxiosError ? error.response?.data?.detail : undefined;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail) && detail.length) {
+    const first = detail[0] as { loc?: unknown[]; msg?: string };
+    const path = Array.isArray(first.loc) ? first.loc.slice(1).join(".") : "";
+    return `模板数据校验失败：${path ? `${path} ` : ""}${first.msg ?? "格式不正确"}`;
+  }
+  return "导入模板失败，请确认选择的是本系统导出的模板 JSON";
+}
+
+async function confirmImport() {
+  importing.value = true;
+  try {
+    const response = await api.post<ImportResult>("/templates/import", {
+      templates: importItems.value.map((item) => ({
+        name: item.name,
+        description: item.description,
+        fields: item.fields.map((field, index) => ({
+          field_name: String(field.field_name ?? "").trim(),
+          field_key: String(field.field_key ?? "").trim(),
+          field_type: field.field_type || "text",
+          description: field.description || "",
+          required: Boolean(field.required),
+          sort_order: index,
+          extraction_type: field.extraction_type || "ai_extract",
+          calc_rule: field.calc_rule ?? null,
+          source_field_key: field.source_field_key ?? null,
+          calc_params: field.calc_params ?? null,
+        })),
+      })),
+      on_conflict: importConflict.value,
+    });
+    const result = response.data;
+    const renamedList = result.templates.filter((item) => item.action === "renamed");
+    const renamedNote = renamedList.length ? `（${renamedList.map((item) => `${item.name} → ${item.new_name}`).join("；")}）` : "";
+    ElMessage.success({
+      message: `导入完成：新建 ${result.created}，覆盖 ${result.updated}，另存 ${result.renamed}，跳过 ${result.skipped}${renamedNote}`,
+      duration: 6000,
+    });
+    importDialogVisible.value = false;
+    await refresh();
+  } catch (error) {
+    ElMessage.error(importErrorMessage(error));
+  } finally {
+    importing.value = false;
+  }
+}
+
 async function selectRecord(record: RecordItem) {
   selectedRecord.value = JSON.parse(JSON.stringify(record));
 }
@@ -433,7 +536,11 @@ onBeforeUnmount(() => {
 
         <section v-else-if="page === 'templates'" class="panel">
           <el-button type="primary" @click="newTemplate">创建模板</el-button>
-          <el-table :data="templates" class="spaced"><el-table-column prop="name" label="名称" /><el-table-column prop="description" label="说明" /><el-table-column label="字段数"><template #default="{ row }">{{ row.fields.length }}</template></el-table-column><el-table-column label="操作"><template #default="{ row }"><el-button link @click="editTemplate(row)">编辑</el-button><el-button link @click="duplicateTemplate(row)">复制</el-button><el-button link type="danger" @click="deleteTemplate(row)">删除</el-button></template></el-table-column></el-table>
+          <el-button type="success" plain @click="pickImportFile">导入模板</el-button>
+          <el-button type="warning" plain :disabled="!templates.length" @click="exportTemplates()">导出全部模板</el-button>
+          <input ref="importInput" type="file" accept=".json,application/json" style="display: none" @change="onImportFileChange" />
+          <p class="field-help">导出为 JSON 文件，拷到另一台机器后用“导入模板”即可恢复；导入时同名模板可选择覆盖更新、跳过或另存为新模板。</p>
+          <el-table :data="templates" class="spaced"><el-table-column prop="name" label="名称" /><el-table-column prop="description" label="说明" /><el-table-column label="字段数"><template #default="{ row }">{{ row.fields.length }}</template></el-table-column><el-table-column label="操作" width="230"><template #default="{ row }"><el-button link @click="editTemplate(row)">编辑</el-button><el-button link @click="duplicateTemplate(row)">复制</el-button><el-button link type="warning" @click="exportTemplates(row.id)">导出</el-button><el-button link type="danger" @click="deleteTemplate(row)">删除</el-button></template></el-table-column></el-table>
         </section>
 
         <section v-else class="panel">
@@ -504,6 +611,24 @@ onBeforeUnmount(() => {
         </div>
       </el-form><template #footer><el-button @click="dialogVisible = false">取消</el-button><el-button type="primary" @click="saveTemplate">保存</el-button></template>
     </el-dialog>
+    <el-dialog v-model="importDialogVisible" title="导入模板" width="680px">
+      <p class="field-help">
+        共解析出 {{ importItems.length }} 个模板，其中 {{ importItems.filter(item => item.exists).length }} 个与本机模板同名。
+        覆盖更新会保留原模板 ID，已关联的任务与结构化结果不会断链；另存为新模板会以“原名 (导入)”新建。
+      </p>
+      <el-radio-group v-model="importConflict" class="import-options">
+        <el-radio value="update">覆盖更新同名模板</el-radio>
+        <el-radio value="skip">跳过同名模板</el-radio>
+        <el-radio value="rename">另存为新模板</el-radio>
+      </el-radio-group>
+      <el-table :data="importItems" class="spaced" max-height="320">
+        <el-table-column prop="name" label="模板名称" width="200" />
+        <el-table-column prop="description" label="说明" show-overflow-tooltip />
+        <el-table-column label="字段数" width="80"><template #default="{ row }">{{ row.fields.length }}</template></el-table-column>
+        <el-table-column label="本机状态" width="100"><template #default="{ row }"><el-tag v-if="row.exists" type="warning" size="small">已存在</el-tag><el-tag v-else type="success" size="small">新模板</el-tag></template></el-table-column>
+      </el-table>
+      <template #footer><el-button @click="importDialogVisible = false">取消</el-button><el-button type="primary" :loading="importing" @click="confirmImport">确认导入</el-button></template>
+    </el-dialog>
     <el-dialog v-model="textDialogVisible" title="原始文字" width="70%"><pre class="raw-text">{{ rawText }}</pre></el-dialog>
     <el-dialog v-model="logsDialogVisible" title="处理日志" width="80%">
       <el-table :data="selectedLogs">
@@ -541,6 +666,7 @@ onBeforeUnmount(() => {
 .result-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 .right { float: right; }
 .field-help { color: #909399; font-size: 13px; margin-bottom: 12px; }
+.import-options { display: flex; flex-wrap: wrap; gap: 18px; }
 .field-card { border: 1px solid #e4e7ed; border-radius: 8px; padding: 12px; margin-bottom: 12px; background: #fafafa; }
 .field-row-main { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .field-row-sub { margin-top: 8px; }
