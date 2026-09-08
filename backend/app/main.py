@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session, selectinload
 from openpyxl import Workbook
+from openpyxl.styles import PatternFill
 
 from .config import AUTH_PASSWORD, AUTH_USERNAME, EXPORT_DIR, SECRET_KEY, SUPPORTED_EXTENSIONS, UPLOAD_DIR
 from .database import Base, engine, get_db
@@ -67,10 +68,22 @@ def startup():
             "claim_token": "VARCHAR(64)",
             "claimed_at": "DATETIME",
             "attempts": "INTEGER DEFAULT 0",
+            "is_duplicate": "BOOLEAN DEFAULT 0",
+            "duplicate_of_id": "INTEGER",
+            "duplicate_of_path": "VARCHAR(1024)",
         }.items():
             if name not in columns:
                 conn.execute(text(f"ALTER TABLE documents ADD COLUMN {name} {definition}"))
                 conn.commit()
+        # Duplicates are kept as separate tasks now, so sha256 must stop being
+        # unique.  SQLite cannot drop a column constraint, but the uniqueness was
+        # created as a standalone index, which can simply be recreated.
+        for index in inspector.get_indexes("documents"):
+            if index.get("unique") and index.get("column_names") == ["sha256"]:
+                conn.execute(text(f'DROP INDEX IF EXISTS "{index["name"]}"'))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_documents_sha256 ON documents (sha256)"))
+                conn.commit()
+                break
         log_columns = [c["name"] for c in inspector.get_columns("processing_logs")]
         for name, definition in {
             "model_name": "VARCHAR(120)",
@@ -218,12 +231,14 @@ async def upload_files(
                 size += len(chunk)
                 output.write(chunk)
         checksum = digest.hexdigest()
-        existing = db.scalar(select(Document).where(Document.sha256 == checksum))
-        if existing:
-            temporary_path.unlink(missing_ok=True)
-            duplicates.append({"path": str(relative_path), "document_id": existing.id})
-            continue
-        target = UPLOAD_DIR / checksum[:2] / checksum / filename
+        # A duplicate is no longer skipped: it becomes its own task, reuses the
+        # earliest identical file's result and stays marked as a duplicate.
+        existing = db.scalar(
+            select(Document).where(Document.sha256 == checksum).order_by(Document.created_at, Document.id)
+        )
+        # Every task owns its physical file, so deleting one duplicate can never
+        # unlink the original file another task still points at.
+        target = UPLOAD_DIR / checksum[:2] / checksum / uuid.uuid4().hex / filename
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary_path.replace(target)
         parts = relative_path.parts[:-1]
@@ -233,11 +248,19 @@ async def upload_files(
             folder_level_1=parts[0] if parts else None,
             folder_level_2=parts[1] if len(parts) > 1 else None,
             folder_level_3=parts[2] if len(parts) > 2 else None,
-            status="pending", template_id=template_id,
+            status="duplicate_waiting" if existing else "pending", template_id=template_id,
+            is_duplicate=bool(existing),
+            duplicate_of_id=existing.id if existing else None,
+            duplicate_of_path=existing.relative_path if existing else None,
         )
         db.add(document)
         db.flush()
         uploaded.append({"id": document.id, "path": str(relative_path)})
+        if existing:
+            duplicates.append({
+                "path": str(relative_path), "document_id": document.id,
+                "duplicate_of_id": existing.id, "duplicate_of_path": existing.relative_path,
+            })
     db.commit()
     return {"uploaded": uploaded, "skipped": skipped, "duplicates": duplicates}
 
@@ -267,7 +290,8 @@ def list_documents(db: Session = Depends(get_db)):
     documents = db.scalars(select(Document).order_by(Document.created_at.desc())).all()
     return [{"id": d.id, "filename": d.filename, "relative_path": d.relative_path, "file_type": d.file_type,
              "status": d.status, "template_id": d.template_id, "created_at": d.created_at, "updated_at": d.updated_at,
-             "error_message": d.error_message} for d in documents]
+             "error_message": d.error_message, "is_duplicate": bool(d.is_duplicate),
+             "duplicate_of_id": d.duplicate_of_id, "duplicate_of_path": d.duplicate_of_path} for d in documents]
 
 
 @app.get("/api/documents/{document_id}")
@@ -276,7 +300,9 @@ def get_document(document_id: int, db: Session = Depends(get_db)):
     if not document:
         raise HTTPException(404, "Document not found")
     return {"id": document.id, "filename": document.filename, "relative_path": document.relative_path,
-            "status": document.status, "raw_text": document.ocr_result.raw_text if document.ocr_result else None,
+            "status": document.status, "is_duplicate": bool(document.is_duplicate),
+            "duplicate_of_id": document.duplicate_of_id, "duplicate_of_path": document.duplicate_of_path,
+            "raw_text": document.ocr_result.raw_text if document.ocr_result else None,
             "logs": [{"id": log.id, "stage": log.stage, "level": log.level, "message": log.message,
                       "model_name": log.model_name,
                       "prompt_tokens": log.prompt_tokens,
@@ -402,12 +428,26 @@ def export_excel(template_id: int, db: Session = Depends(get_db)):
             max_levels = len(parts)
 
     folder_headers = [f"folder_level_{i+1}" for i in range(max_levels)]
-    sheet.append([*folder_headers, *[field.field_name for field in fields]])
+    sheet.append([*folder_headers, *[field.field_name for field in fields], "是否重复文件", "重复源文件"])
 
+    # Duplicate tasks are exported like any other row, but get two extra marking
+    # columns and a highlighted row so they stand out in the spreadsheet.
+    duplicate_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
     for record, document, parts in doc_folder_parts:
         data = json.loads(record.json_data) if record else {}
         folder_values = [parts[i] if i < len(parts) else "" for i in range(max_levels)]
-        sheet.append([*folder_values, *[data.get(field.field_key) for field in fields]])
+        duplicate_source = document.duplicate_of_path or (
+            f"任务#{document.duplicate_of_id}" if document.duplicate_of_id else ""
+        )
+        sheet.append([
+            *folder_values,
+            *[data.get(field.field_key) for field in fields],
+            "是" if document.is_duplicate else "",
+            duplicate_source if document.is_duplicate else "",
+        ])
+        if document.is_duplicate:
+            for cell in sheet[sheet.max_row]:
+                cell.fill = duplicate_fill
 
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     output = EXPORT_DIR / f"{re.sub(r'[^A-Za-z0-9_-]', '_', template.name)}-{datetime.utcnow():%Y%m%d%H%M%S}.xlsx"

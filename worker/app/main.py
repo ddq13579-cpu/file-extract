@@ -10,7 +10,7 @@ from typing import Any, Sequence
 from sqlalchemy import or_, select, text
 
 from .config import (
-    GEMINI_CONCURRENCY,
+    AI_CONCURRENCY,
     OCR_CONCURRENCY,
     PROCESSING_LEASE_SECONDS,
     WORKER_BATCH_SIZE,
@@ -18,7 +18,7 @@ from .config import (
 )
 from .database import SessionLocal
 from .models import Document, OCRResult, ProcessingLog, Record, TemplateField
-from .services.ai.dashscope import DashScopeProvider, invalid_id_numbers
+from .services.ai.openai_compatible import OpenAICompatibleProvider, invalid_id_numbers
 from .services.calculator import calculate_template_fields
 from .services.pdf_extractor import extract_pdf_text
 
@@ -45,7 +45,7 @@ def mark_failed(document_id: int, claim_token: str, stage: str, error: Exception
 def validate_data(data: dict[str, Any], fields: Sequence[TemplateField]) -> dict[str, Any]:
     expected = {field.field_key for field in fields}
     if set(data) != expected:
-        raise ValueError("DashScope response keys do not exactly match template fields")
+        raise ValueError("Model response keys do not exactly match template fields")
     for field in fields:
         value = data[field.field_key]
         if value is None:
@@ -113,7 +113,7 @@ def extract_ocr(document_id: int, claim_token: str) -> int | None:
                 if not raw_text:
                     raise ValueError("PDF has no extractable text; scanned PDF OCR is not supported in V1")
             else:
-                raw_text, engine = "", "dashscope_vision"
+                raw_text, engine = "", "vision_model"
             ocr_result = db.scalar(select(OCRResult).where(OCRResult.document_id == document_id))
             if ocr_result:
                 ocr_result.engine, ocr_result.raw_text = engine, raw_text
@@ -147,7 +147,7 @@ def extract_with_model(document_id: int, claim_token: str, batch_started_at: flo
             if not fields:
                 raise ValueError("Template has no fields")
             document.status = "ai_processing"
-            log(db, document_id, "ai", "info", "DashScope request started")
+            log(db, document_id, "ai", "info", "Model request started")
             db.commit()
             raw_text = ocr_result.raw_text
             ai_fields = [f for f in fields if getattr(f, "extraction_type", "ai_extract") != "calculated"]
@@ -161,7 +161,7 @@ def extract_with_model(document_id: int, claim_token: str, batch_started_at: flo
                 for field in ai_fields
             ]
 
-        provider = DashScopeProvider()
+        provider = OpenAICompatibleProvider()
         source_path = None if document_file_type == "pdf" else document_path
         extraction = None
         data = None
@@ -180,7 +180,7 @@ def extract_with_model(document_id: int, claim_token: str, batch_started_at: flo
                             document_id=document_id,
                             stage="ai",
                             level="error",
-                            message=f"DashScope request failed (attempt {attempt_number}): {error}",
+                            message=f"Model request failed (attempt {attempt_number}): {error}",
                             attempt=attempt_number,
                             request_started_at=request_started_at,
                             request_completed_at=request_completed_at,
@@ -197,7 +197,7 @@ def extract_with_model(document_id: int, claim_token: str, batch_started_at: flo
                         document_id=document_id,
                         stage="ai",
                         level="info",
-                        message=f"DashScope request completed (attempt {attempt_number})",
+                        message=f"Model request completed (attempt {attempt_number})",
                         model_name=usage.actual_model,
                         prompt_tokens=usage.prompt_tokens,
                         candidates_tokens=usage.candidates_tokens,
@@ -250,10 +250,94 @@ def extract_with_model(document_id: int, claim_token: str, batch_started_at: flo
         mark_failed(document_id, claim_token, "ai", error)
 
 
+def resolve_duplicate(document_id: int):
+    """Reuse an identical earlier task's result instead of re-running OCR/AI.
+
+    A duplicate task is uploaded with status ``duplicate_waiting``, which the claim
+    query never picks up.  Resolution happens here so an unfinished source task
+    simply keeps the copy waiting, while an unusable source (deleted, failed, or
+    extracted with a different template) falls back to full processing and keeps
+    its duplicate mark.
+    """
+    with SessionLocal() as db:
+        document = db.get(Document, document_id)
+        if not document or document.status != "duplicate_waiting":
+            return
+        source = db.get(Document, document.duplicate_of_id) if document.duplicate_of_id else None
+        source_label = document.duplicate_of_path or (
+            f"任务#{document.duplicate_of_id}" if document.duplicate_of_id else "未知文件"
+        )
+        record = None
+        if source:
+            record = db.scalar(
+                select(Record).where(
+                    Record.document_id == source.id,
+                    Record.template_id == document.template_id,
+                    Record.status == "completed",
+                )
+            )
+
+        if record:
+            source_ocr = db.scalar(select(OCRResult).where(OCRResult.document_id == source.id))
+            engine_name = source_ocr.engine if source_ocr else "duplicate_reuse"
+            raw_text = source_ocr.raw_text if source_ocr else ""
+            ocr_result = db.scalar(select(OCRResult).where(OCRResult.document_id == document_id))
+            if ocr_result:
+                ocr_result.engine, ocr_result.raw_text = engine_name, raw_text
+            else:
+                db.add(OCRResult(document_id=document_id, engine=engine_name, raw_text=raw_text))
+            existing_record = db.scalar(
+                select(Record).where(
+                    Record.document_id == document_id, Record.template_id == document.template_id
+                )
+            )
+            if existing_record:
+                existing_record.json_data, existing_record.status = record.json_data, "completed"
+            else:
+                db.add(Record(
+                    document_id=document_id,
+                    template_id=document.template_id,
+                    json_data=record.json_data,
+                    status="completed",
+                ))
+            document.status, document.error_message = "completed", None
+            log(db, document_id, "duplicate", "info",
+                f"内容与 {source_label}（任务#{source.id}）完全相同，已复用其文字和提取结果，未调用 OCR/AI")
+            db.commit()
+            logger.info("document=%s reused the result of document=%s", document_id, source.id)
+            return
+
+        if not source:
+            log(db, document_id, "duplicate", "warning",
+                f"重复源任务已不存在（{source_label}），改为完整重新处理")
+        elif source.status in {"completed", "failed", "skipped"}:
+            log(db, document_id, "duplicate", "warning",
+                f"{source_label}（任务#{source.id}，状态 {source.status}）没有可复用的同模板结果，改为完整重新处理")
+        else:
+            # The source task is still queued or in progress; check again next poll.
+            return
+        document.status = "pending"
+        db.commit()
+
+
+def resolve_duplicates():
+    with SessionLocal() as db:
+        waiting_ids = list(db.scalars(
+            select(Document.id)
+            .where(Document.status == "duplicate_waiting")
+            .order_by(Document.created_at)
+        ).all())
+    for document_id in waiting_ids:
+        try:
+            resolve_duplicate(document_id)
+        except Exception:
+            logger.exception("document=%s duplicate resolution failed", document_id)
+
+
 def process_batch(claims: list[tuple[int, str]], ocr_executor: ThreadPoolExecutor):
     batch_started_at = time.monotonic()
-    logger.info("Starting batch: %s documents, preparation concurrency=%s, DashScope concurrency=%s",
-                len(claims), OCR_CONCURRENCY, GEMINI_CONCURRENCY)
+    logger.info("Starting batch: %s documents, preparation concurrency=%s, model concurrency=%s",
+                len(claims), OCR_CONCURRENCY, AI_CONCURRENCY)
     ocr_completed: list[tuple[int, str]] = []
     futures = [ocr_executor.submit(extract_ocr, document_id, claim_token) for document_id, claim_token in claims]
     for future in as_completed(futures):
@@ -262,8 +346,8 @@ def process_batch(claims: list[tuple[int, str]], ocr_executor: ThreadPoolExecuto
             claim_token = next(token for claimed_id, token in claims if claimed_id == document_id)
             ocr_completed.append((document_id, claim_token))
 
-    logger.info("OCR batch completed: %s/%s documents; starting DashScope batch", len(ocr_completed), len(claims))
-    with ThreadPoolExecutor(max_workers=GEMINI_CONCURRENCY, thread_name_prefix="gemini") as executor:
+    logger.info("OCR batch completed: %s/%s documents; starting model batch", len(ocr_completed), len(claims))
+    with ThreadPoolExecutor(max_workers=AI_CONCURRENCY, thread_name_prefix="ai") as executor:
         futures = [
             executor.submit(extract_with_model, document_id, claim_token, batch_started_at)
             for document_id, claim_token in ocr_completed
@@ -271,11 +355,14 @@ def process_batch(claims: list[tuple[int, str]], ocr_executor: ThreadPoolExecuto
         for future in as_completed(futures):
             future.result()
     logger.info("Batch completed in %.2fs", time.monotonic() - batch_started_at)
+    # Duplicates of files from this very batch can now reuse what was just written.
+    resolve_duplicates()
 
 
 def run():
     with ThreadPoolExecutor(max_workers=OCR_CONCURRENCY, thread_name_prefix="ocr") as ocr_executor:
         while True:
+            resolve_duplicates()
             claims = claim_pending_batch()
             if claims:
                 process_batch(claims, ocr_executor)

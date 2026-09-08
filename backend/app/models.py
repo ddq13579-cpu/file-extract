@@ -48,12 +48,20 @@ class Document(Timestamped, Base):
     file_type: Mapped[str] = mapped_column(String(20))
     mime_type: Mapped[str] = mapped_column(String(120), default="")
     file_size: Mapped[int] = mapped_column(Integer)
-    sha256: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    # Identical content is no longer skipped: every copy becomes its own marked
+    # task, so sha256 stays indexed for lookups but must not be unique.
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
     folder_level_1: Mapped[str | None] = mapped_column(String(255), nullable=True)
     folder_level_2: Mapped[str | None] = mapped_column(String(255), nullable=True)
     folder_level_3: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_duplicate: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Deliberately not a foreign key: SQLite runs with PRAGMA foreign_keys=ON, so a
+    # self reference would make deleting the source task fail.  duplicate_of_path
+    # keeps a readable snapshot for after the source task has been deleted.
+    duplicate_of_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duplicate_of_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)

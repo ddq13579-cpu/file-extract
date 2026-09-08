@@ -18,7 +18,7 @@ type Field = {
 };
 type Template = { id: number; name: string; description: string; fields: Field[] };
 type SelectedFile = { file: File; path: string };
-type Document = { id: number; filename: string; relative_path: string; file_type: string; status: string; template_id: number; updated_at: string; error_message?: string };
+type Document = { id: number; filename: string; relative_path: string; file_type: string; status: string; template_id: number; updated_at: string; error_message?: string; is_duplicate?: boolean; duplicate_of_id?: number | null; duplicate_of_path?: string | null };
 type RecordItem = { id: number; document_id: number; template_id: number; status: string; json_data: Record<string, unknown>; updated_at: string };
 type ProcessingLog = { id: number; stage: string; level: string; message: string; model_name?: string; prompt_tokens?: number; candidates_tokens?: number; total_tokens?: number; attempt?: number; request_started_at?: string; request_completed_at?: string; duration_ms?: number; response_json?: string; created_at: string };
 
@@ -123,7 +123,8 @@ async function upload() {
   selectedFiles.value = [];
   await refresh();
   if (response.data.uploaded.length) await api.post("/files/process", response.data.uploaded.map((item: { id: number }) => item.id));
-  ElMessage.success(`已加入 ${response.data.uploaded.length} 个文件；重复或跳过 ${response.data.duplicates.length + response.data.skipped.length} 个`);
+  const duplicateCount: number = response.data.duplicates.length;
+  ElMessage.success(`已加入 ${response.data.uploaded.length} 个文件${duplicateCount ? `，其中 ${duplicateCount} 个为重复文件，将复用原结果并标记` : ""}；跳过 ${response.data.skipped.length} 个不支持的文件`);
   window.setTimeout(refresh, 1500);
 }
 
@@ -324,6 +325,24 @@ function openDocument(documentId: number) {
   const token = localStorage.getItem("token") || "";
   window.open(`/api/documents/${documentId}/file?token=${encodeURIComponent(token)}`, "_blank");
 }
+const statusLabels: Record<string, string> = {
+  pending: "排队中",
+  duplicate_waiting: "等待复用结果",
+  processing: "文字提取中",
+  ocr_completed: "文字提取完成",
+  ai_processing: "AI 提取中",
+  completed: "已完成",
+  failed: "失败",
+  skipped: "已跳过",
+};
+function statusText(status: string): string {
+  return statusLabels[status] || status;
+}
+function duplicateLabel(document: Document): string {
+  const source = document.duplicate_of_path
+    || (document.duplicate_of_id ? `任务 #${document.duplicate_of_id}` : "未知文件");
+  return `与「${source}」内容完全相同，已复用其文字和提取结果，未重新调用 OCR/AI`;
+}
 function recordValue(key: string): string {
   const value = selectedRecord.value?.json_data[key];
   return value === null || value === undefined ? "" : String(value);
@@ -424,7 +443,7 @@ onBeforeUnmount(() => {
             <el-button type="danger" style="margin-right: 12px" @click="deleteAllDocuments">删除所有任务</el-button>
             <el-button type="success" @click="exportExcel">导出当前模板 Excel</el-button>
           </div>
-          <el-table :data="documents" class="spaced"><el-table-column prop="filename" label="文件名" /><el-table-column prop="relative_path" label="来源目录" /><el-table-column prop="file_type" label="类型" /><el-table-column prop="status" label="状态" /><el-table-column label="查看"><template #default="{ row }"><el-button link @click="openDocument(row.id)">原文件</el-button><el-button link @click="showRawText(row.id)">原始文字</el-button><el-button link @click="showLogs(row.id)">处理日志</el-button><el-button v-if="row.status === 'failed'" link type="warning" @click="retryDocument(row.id)">重新处理</el-button><el-button link type="danger" :disabled="row.status === 'processing' || row.status === 'ai_processing'" @click="deleteDocument(row)">删除任务</el-button></template></el-table-column></el-table>
+          <el-table :data="documents" class="spaced"><el-table-column prop="filename" label="文件名" /><el-table-column prop="relative_path" label="来源目录" /><el-table-column prop="file_type" label="类型" /><el-table-column label="状态"><template #default="{ row }"><span :class="{ 'status-failed': row.status === 'failed' }">{{ statusText(row.status) }}</span></template></el-table-column><el-table-column label="重复标记" width="120"><template #default="{ row }"><el-tooltip v-if="row.is_duplicate" :content="duplicateLabel(row)" placement="top"><el-tag type="warning" size="small">重复文件</el-tag></el-tooltip><span v-else>-</span></template></el-table-column><el-table-column label="查看"><template #default="{ row }"><el-button link @click="openDocument(row.id)">原文件</el-button><el-button link @click="showRawText(row.id)">原始文字</el-button><el-button link @click="showLogs(row.id)">处理日志</el-button><el-button v-if="row.status === 'failed'" link type="warning" @click="retryDocument(row.id)">重新处理</el-button><el-button link type="danger" :disabled="row.status === 'processing' || row.status === 'ai_processing'" @click="deleteDocument(row)">删除任务</el-button></template></el-table-column></el-table>
         </section>
       </el-main>
     </el-container>
@@ -518,6 +537,7 @@ onBeforeUnmount(() => {
 .panel { background: white; padding: 24px; border-radius: 8px; }
 .dropzone { margin: 20px 0; padding: 42px; border: 2px dashed #a8abb2; border-radius: 8px; text-align: center; color: #606266; }
 .spaced { margin-top: 20px; }
+.status-failed { color: #f56c6c; font-weight: 600; }
 .result-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 .right { float: right; }
 .field-help { color: #909399; font-size: 13px; margin-bottom: 12px; }

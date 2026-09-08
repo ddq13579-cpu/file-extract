@@ -17,7 +17,7 @@ from openai.types.chat import (
 from PIL import Image
 from pillow_heif import register_heif_opener
 
-from ...config import DASHSCOPE_API_KEY, DASHSCOPE_BASE_URL, DASHSCOPE_MODEL
+from ...config import API_KEY, BASE_URL, MODEL
 from .base import AIExtraction, AIProvider, AIUsage
 
 ID_PATTERN = re.compile(r"(?<!\d)(\d{17}[\dXx])(?!\d)")
@@ -53,19 +53,20 @@ def invalid_id_numbers(value: Any) -> list[str]:
     return _invalid_id_numbers(value)
 
 
-class DashScopeResponseError(ValueError):
+class ModelResponseError(ValueError):
     def __init__(self, message: str, response_json: str):
         super().__init__(message)
         self.response_json = response_json
 
 
-class DashScopeProvider(AIProvider):
+class OpenAICompatibleProvider(AIProvider):
     def __init__(self):
-        if not DASHSCOPE_API_KEY:
-            raise RuntimeError("DASHSCOPE_API_KEY is not configured")
-        if not DASHSCOPE_MODEL:
-            raise RuntimeError("DASHSCOPE_MODEL is not configured")
-        self.client = OpenAI(api_key=DASHSCOPE_API_KEY, base_url=DASHSCOPE_BASE_URL)
+        if not API_KEY:
+            raise RuntimeError("API_KEY is not configured")
+        if not MODEL:
+            raise RuntimeError("MODEL is not configured")
+        # BASE_URL 未配置时交给 SDK 使用自身默认地址，避免空字符串导致构造失败。
+        self.client = OpenAI(api_key=API_KEY, base_url=BASE_URL or None)
 
     def extract(
         self,
@@ -74,7 +75,7 @@ class DashScopeProvider(AIProvider):
         document_path: Path | None = None,
     ) -> AIExtraction:
         prompt = self._build_prompt(fields, raw_text)
-        model = DASHSCOPE_MODEL
+        model = MODEL
         request_message: ChatCompletionUserMessageParam
         if document_path:
             content: list[ChatCompletionContentPartTextParam | ChatCompletionContentPartImageParam] = [
@@ -95,13 +96,13 @@ class DashScopeProvider(AIProvider):
         )
         response_content = response.choices[0].message.content
         if not response_content:
-            raise RuntimeError("DashScope returned an empty response")
+            raise RuntimeError("The model returned an empty response")
         try:
             data = json.loads(response_content)
         except json.JSONDecodeError as error:
-            raise DashScopeResponseError(f"Invalid JSON response: {error}", response_content) from error
+            raise ModelResponseError(f"Invalid JSON response: {error}", response_content) from error
         if not isinstance(data, dict):
-            raise DashScopeResponseError("DashScope response must be a JSON object", response_content)
+            raise ModelResponseError("The model response must be a JSON object", response_content)
         usage = response.usage
         return AIExtraction(
             data=data,

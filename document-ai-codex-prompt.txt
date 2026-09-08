@@ -299,6 +299,9 @@ folder_level_1
 folder_level_2
 status
 error_message
+is_duplicate
+duplicate_of_id
+duplicate_of_path
 created_at
 updated_at
 
@@ -679,17 +682,40 @@ error_message
 
 如果数据库已经存在相同 SHA-256：
 
+不要跳过，仍然建立独立任务。
+
 不要重新 OCR。
 
-不要重新调用 Gemini。
+不要重新调用模型。
 
-提示：
+直接复用最早那份相同文件的 OCR 文字和结构化结果：
+任务先置为 duplicate_waiting，复用成功后置为 completed。
 
-文件已经处理过。
+标记：
+
+documents.is_duplicate = true
+
+documents.duplicate_of_id = 源任务 id
+
+documents.duplicate_of_path = 源文件相对路径快照
+
+处理结果页面显示橙色“重复文件”标记，
+悬停提示与哪个文件重复；
+处理日志写入一条 stage=duplicate 的记录；
+导出 Excel 追加“是否重复文件”“重复源文件”两列，
+并给重复行加浅黄底色。
+
+如果源任务没有可复用的同模板结果
+（已删除、失败，或使用了其他模板）：
+该重复任务自动回退为完整重新处理，
+重复标记保留。
+
+每个任务独占一个上传子目录，
+删除任一任务不能影响其他任务的原文件。
 
 如果文件内容发生改变：
 SHA-256 改变
-→ 可以重新处理。
+→ 视为新文件正常处理。
 
 
 ==================================================
