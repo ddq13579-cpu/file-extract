@@ -3,7 +3,6 @@ import hmac
 import json
 import mimetypes
 import re
-import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -12,7 +11,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session, selectinload
 from openpyxl import Workbook
@@ -62,9 +61,6 @@ def startup():
     with engine.connect() as conn:
         inspector = inspect(engine)
         columns = [c["name"] for c in inspector.get_columns("documents")]
-        if "folder_level_3" not in columns:
-            conn.execute(text("ALTER TABLE documents ADD COLUMN folder_level_3 VARCHAR(255)"))
-            conn.commit()
         for name, definition in {
             "claim_token": "VARCHAR(64)",
             "claimed_at": "DATETIME",
@@ -184,7 +180,7 @@ def unique_template_name(name: str, db: Session) -> str:
 
 
 def template_to_dict(template: Template) -> dict:
-    """导出用的纯数据结构，格式与 scripts/export_templates.py 保持一致，两边文件可互通。"""
+    """导出模板 JSON 的纯数据结构。"""
     return {
         "name": template.name,
         "description": template.description or "",
@@ -369,9 +365,6 @@ async def upload_files(
         document = Document(
             filename=filename, relative_path=str(relative_path), file_path=str(target), file_type=suffix[1:].upper(),
             mime_type=file.content_type or mimetypes.guess_type(filename)[0] or "", file_size=size, sha256=checksum,
-            folder_level_1=parts[0] if parts else None,
-            folder_level_2=parts[1] if len(parts) > 1 else None,
-            folder_level_3=parts[2] if len(parts) > 2 else None,
             status="duplicate_waiting" if existing else "pending", template_id=template_id,
             is_duplicate=bool(existing),
             duplicate_of_id=existing.id if existing else None,

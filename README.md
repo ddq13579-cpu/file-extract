@@ -42,7 +42,7 @@ docker compose logs -f worker
 | 模板与字段（`templates`、`template_fields`）、任务、OCR 文字、结构化结果、处理日志 | `data/database/app.db`（SQLite，由 `DATABASE_URL` 指定） | 否，`.gitignore` 忽略 |
 | 上传的原文件 | `data/uploads/` | 否 |
 | 导出的 Excel | `data/exports/` | 否 |
-| 模板 JSON 备份 | `data/templates.json`（由脚本生成） | 是，可提交 |
+| 模板 JSON 备份 | 浏览器从“模板管理”导出的 JSON 文件 | 可按需提交 |
 
 模板没有单独的文件，全部存在 `app.db` 的 `templates` + `template_fields` 两张表里，所以**换机器时只 `git clone` 是拿不到模板的**，必须把数据带过去。有三种做法：
 
@@ -62,27 +62,15 @@ docker compose exec backend python -c "import sqlite3;c=sqlite3.connect('/data/d
 
 ### 方式二：只搬模板（推荐，跨机器最稳）
 
-两个脚本只用 Python 标准库，宿主机上直接跑，不需要启动 Docker：
-
-```bash
-# 旧机器：导出模板
-python3 scripts/export_templates.py                     # 默认写到 data/templates.json
-
-# 把 data/templates.json 传到新机器（scp / U 盘 / git），然后在新机器上：
-docker compose stop backend worker                      # 建议先停服务
-python3 scripts/import_templates.py --file data/templates.json --dry-run   # 先预览
-python3 scripts/import_templates.py --file data/templates.json             # 正式导入
-docker compose up -d --build
-```
+在旧机器的“模板管理”点击“导出模板”，将下载的 JSON 文件传到新机器（scp、U 盘或 git 均可）。在新机器启动服务后，进入“模板管理”点击“导入模板”，选择该 JSON 文件并设置同名模板的处理方式。
 
 - 导出文件不含数据库自增 id，字段顺序、类型、必填、说明以及“AI 提取 / 程序自动计算”配置都会完整保留。
-- 目标库不存在或缺列时，脚本会自动建表、补列；同名模板默认整体覆盖（`--on-conflict update`），也可用 `skip` 跳过或 `rename` 另存为新名字。
-- 覆盖时保留原 `template_id`，已有任务与结构化结果的关联不会断；导入前会先整体校验，任一模板非法则一条都不写入。
-- 常用参数：`--db` 指定数据库路径、`--out` 指定导出路径、`--dry-run` 只预览不写库。
+- 同名模板可选择覆盖更新、跳过或另存为新模板。覆盖时保留原 `template_id`，已有任务与结构化结果的关联不会断。
+- 导入会先校验文件；任一模板非法则整批不会写入。
 
 ### 方式三：让模板随 git 一起走
 
-`data/templates.json` 没有被 `.gitignore` 忽略。每次改完模板执行 `python3 scripts/export_templates.py`，再 `git add data/templates.json && git commit`，新机器 `git clone` 后只需运行一次 `python3 scripts/import_templates.py --file data/templates.json` 就能恢复模板。
+在“模板管理”导出 JSON 后，可将它放入仓库（例如 `data/templates.json`）并提交。新机器拉取代码后，启动服务并在“模板管理”中导入该 JSON 文件即可恢复模板。
 
 ## 使用
 
