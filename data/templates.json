@@ -1,0 +1,287 @@
+{
+  "version": 1,
+  "exported_at": "2026-09-08T21:54:31+08:00",
+  "source_database": "/Users/dyaln/Downloads/OCR云项目/data/database/app.db",
+  "templates": [
+    {
+      "name": "学平险",
+      "description": "",
+      "created_at": "2026-09-05 19:13:59.186531",
+      "updated_at": "2026-09-05 19:13:59.186538",
+      "fields": [
+        {
+          "field_name": "签单日期",
+          "field_key": "field_1",
+          "field_type": "date",
+          "description": "“签单日期”后的日期",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "投保人",
+          "field_key": "field_2",
+          "field_type": "text",
+          "description": "“投保人信息”后的姓名/名称后面的时候投保人",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "投保人身份证号",
+          "field_key": "field_3",
+          "field_type": "text",
+          "description": "“投保人信息”后面的证件号码，不是被保险人后面的",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "被保险人",
+          "field_key": "field_4",
+          "field_type": "text",
+          "description": "“被保险人信息”后的姓名/名称后面的名字，不是投保人信息里面的",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "被保险人身份证号",
+          "field_key": "field_5",
+          "field_type": "text",
+          "description": "“被保险人信息”后面的证件号码，不是投保人后面的",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "年龄范围",
+          "field_key": "field_6",
+          "field_type": "text",
+          "description": "“被保险人信息”后面的身份证号中第7位到14位是出生日期，用这个日期和北京时间的今天计算投保人年龄，按照周岁计算：只有当今年的生日已经到达（或已经过了生日日期）时，年龄才增加 1 岁；如果今年生日尚未到达，则年龄仍按上一周岁计算，大于5岁为“大”，小于5岁为“小”",
+          "required": true,
+          "extraction_type": "calculated",
+          "calc_rule": "range_from_value",
+          "source_field_key": "field_7",
+          "calc_params": "{\"threshold\": 5, \"gt_value\": \"大\", \"lte_value\": \"小\"}"
+        },
+        {
+          "field_name": "年龄",
+          "field_key": "field_7",
+          "field_type": "number",
+          "description": "“被保险人信息”后面的身份证号中第7位到14位是出生日期，用这个日期和北京时间的今天计算投保人年龄，按照周岁计算：只有当今年的生日已经到达（或已经过了生日日期）时，年龄才增加 1 岁；如果今年生日尚未到达，则年龄仍按上一周岁计算",
+          "required": true,
+          "extraction_type": "calculated",
+          "calc_rule": "age_from_id",
+          "source_field_key": "field_5",
+          "calc_params": null
+        },
+        {
+          "field_name": "保费",
+          "field_key": "field_8",
+          "field_type": "number",
+          "description": "“保险费合计”后面的金额数字是保费，没有符号",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "生效时期",
+          "field_key": "field_12",
+          "field_type": "date",
+          "description": "“保险期间”字段后的第一个日期是生效日期",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "留空",
+          "field_key": "field_9",
+          "field_type": "text",
+          "description": "",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "留空",
+          "field_key": "field_10",
+          "field_type": "text",
+          "description": "",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "佣金",
+          "field_key": "field_11",
+          "field_type": "number",
+          "description": "“被保险人信息”后面的身份证号中第7位到14位是出生日期，用这个日期和北京时间的今天计算投保人年龄，按照周岁计算：只有当今年的生日已经到达（或已经过了生日日期）时，年龄才增加 1 岁；如果今年生日尚未到达，则年龄仍按上一周岁计算，大于5岁为“大”，小于5岁为“小”。年龄范围“小”佣金为“18”，年龄范围“大”佣金“44”",
+          "required": true,
+          "extraction_type": "calculated",
+          "calc_rule": "value_map",
+          "source_field_key": "field_6",
+          "calc_params": "{\"map\": {\"小\": 18, \"大\": 44}}"
+        }
+      ]
+    },
+    {
+      "name": "学平险 - 副本",
+      "description": "防误删",
+      "created_at": "2026-09-08 03:55:11.209359",
+      "updated_at": "2026-09-08 03:55:11.209360",
+      "fields": [
+        {
+          "field_name": "签单日期",
+          "field_key": "field_1",
+          "field_type": "date",
+          "description": "“签单日期”后的日期",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "投保人",
+          "field_key": "field_2",
+          "field_type": "text",
+          "description": "“投保人信息”后的姓名/名称后面的时候投保人",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "投保人身份证号",
+          "field_key": "field_3",
+          "field_type": "text",
+          "description": "“投保人信息”后面的证件号码，不是被保险人后面的",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "被保险人",
+          "field_key": "field_4",
+          "field_type": "text",
+          "description": "“被保险人信息”后的姓名/名称后面的名字，不是投保人信息里面的",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "被保险人身份证号",
+          "field_key": "field_5",
+          "field_type": "text",
+          "description": "“被保险人信息”后面的证件号码，不是投保人后面的",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "年龄范围",
+          "field_key": "field_6",
+          "field_type": "text",
+          "description": "“被保险人信息”后面的身份证号中第7位到14位是出生日期，用这个日期和北京时间的今天计算投保人年龄，按照周岁计算：只有当今年的生日已经到达（或已经过了生日日期）时，年龄才增加 1 岁；如果今年生日尚未到达，则年龄仍按上一周岁计算，大于5岁为“大”，小于5岁为“小”",
+          "required": true,
+          "extraction_type": "calculated",
+          "calc_rule": "range_from_value",
+          "source_field_key": "field_7",
+          "calc_params": "{\"threshold\": 5, \"gt_value\": \"大\", \"lte_value\": \"小\"}"
+        },
+        {
+          "field_name": "年龄",
+          "field_key": "field_7",
+          "field_type": "number",
+          "description": "“被保险人信息”后面的身份证号中第7位到14位是出生日期，用这个日期和北京时间的今天计算投保人年龄，按照周岁计算：只有当今年的生日已经到达（或已经过了生日日期）时，年龄才增加 1 岁；如果今年生日尚未到达，则年龄仍按上一周岁计算",
+          "required": true,
+          "extraction_type": "calculated",
+          "calc_rule": "age_from_id",
+          "source_field_key": "field_5",
+          "calc_params": null
+        },
+        {
+          "field_name": "保费",
+          "field_key": "field_8",
+          "field_type": "number",
+          "description": "“保险费合计”后面的金额数字是保费，没有符号",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "生效时期",
+          "field_key": "field_12",
+          "field_type": "date",
+          "description": "“保险期间”字段后的第一个日期是生效日期",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "留空",
+          "field_key": "field_9",
+          "field_type": "text",
+          "description": "",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "留空",
+          "field_key": "field_10",
+          "field_type": "text",
+          "description": "",
+          "required": true,
+          "extraction_type": "ai_extract",
+          "calc_rule": null,
+          "source_field_key": null,
+          "calc_params": null
+        },
+        {
+          "field_name": "佣金",
+          "field_key": "field_11",
+          "field_type": "number",
+          "description": "“被保险人信息”后面的身份证号中第7位到14位是出生日期，用这个日期和北京时间的今天计算投保人年龄，按照周岁计算：只有当今年的生日已经到达（或已经过了生日日期）时，年龄才增加 1 岁；如果今年生日尚未到达，则年龄仍按上一周岁计算，大于5岁为“大”，小于5岁为“小”。年龄范围“小”佣金为“18”，年龄范围“大”佣金“44”",
+          "required": true,
+          "extraction_type": "calculated",
+          "calc_rule": "value_map",
+          "source_field_key": "field_6",
+          "calc_params": "{\"map\": {\"小\": 18, \"大\": 44}}"
+        }
+      ]
+    }
+  ]
+}
