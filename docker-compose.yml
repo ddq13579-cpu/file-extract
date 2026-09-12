@@ -15,6 +15,12 @@ services:
     env_file: .env
     volumes:
       - ./data:/data
+      # SQLite 必须落在 Docker 命名卷里。macOS/Windows 的 Docker Desktop 用
+      # virtiofs/gRPC-FUSE 共享目录，不支持 WAL 需要的 -shm 共享内存与跨容器
+      # POSIX 锁，会出现 "disk I/O error" 和 "database disk image is malformed"。
+      # 命名卷在虚拟机内部的 ext4 上，语义完整。挂载点更深，会覆盖 ./data 里的
+      # 同名目录；uploads 与 exports 仍在宿主机 ./data 下。
+      - database:/data/database
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')\""]
       interval: 5s
@@ -29,7 +35,11 @@ services:
     env_file: .env
     volumes:
       - ./data:/data
+      - database:/data/database
     depends_on:
       backend:
         condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  database:

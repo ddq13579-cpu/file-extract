@@ -1,9 +1,10 @@
 import json
 import logging
+import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -16,9 +17,9 @@ from .config import (
     WORKER_BATCH_SIZE,
     WORKER_POLL_SECONDS,
 )
-from .database import SessionLocal
+from .database import SessionLocal, checkpoint_sqlite
 from .models import Document, OCRResult, ProcessingLog, Record, TemplateField
-from .services.ai.openai_compatible import OpenAICompatibleProvider, invalid_id_numbers
+from .services.ai.openai_compatible import ModelResponseError, OpenAICompatibleProvider, invalid_id_numbers
 from .services.calculator import calculate_template_fields
 from .services.pdf_extractor import extract_pdf_text
 
@@ -42,10 +43,40 @@ def mark_failed(document_id: int, claim_token: str, stage: str, error: Exception
             db.commit()
 
 
+def log_model_request_failure(document_id: int, attempt_number: int, error: Exception,
+                              request_started_at: datetime, started_monotonic: float,
+                              will_retry: bool) -> None:
+    """把失败请求的耗时、Token 和模型原始返回写进处理日志；还会重试时降级为 warning。"""
+    usage = getattr(error, "usage", None)
+    with SessionLocal() as db:
+        db.add(ProcessingLog(
+            document_id=document_id,
+            stage="ai",
+            level="warning" if will_retry else "error",
+            message=(f"Model request failed (attempt {attempt_number}): {error}"
+                     + ("，将重试一次" if will_retry else "")),
+            model_name=getattr(usage, "actual_model", None),
+            prompt_tokens=getattr(usage, "prompt_tokens", None),
+            candidates_tokens=getattr(usage, "candidates_tokens", None),
+            total_tokens=getattr(usage, "total_tokens", None),
+            attempt=attempt_number,
+            request_started_at=request_started_at,
+            request_completed_at=datetime.utcnow(),
+            duration_ms=round((time.monotonic() - started_monotonic) * 1000),
+            response_json=getattr(error, "response_json", None),
+        ))
+        db.commit()
+
+
 def validate_data(data: dict[str, Any], fields: Sequence[TemplateField]) -> dict[str, Any]:
     expected = {field.field_key for field in fields}
     if set(data) != expected:
-        raise ValueError("Model response keys do not exactly match template fields")
+        missing = sorted(expected - set(data))
+        unexpected = sorted(set(data) - expected)
+        raise ValueError(
+            "Model response keys do not exactly match template fields"
+            f" (missing: {missing or '无'}, unexpected: {unexpected or '无'})"
+        )
     for field in fields:
         value = data[field.field_key]
         if value is None:
@@ -57,8 +88,104 @@ def validate_data(data: dict[str, Any], fields: Sequence[TemplateField]) -> dict
             "boolean": isinstance(value, bool),
         }[field.field_type]
         if not valid:
-            raise ValueError(f"Invalid type for {field.field_key}")
+            raise ValueError(
+                f"Invalid type for {field.field_key}: expected {field.field_type}, got {value!r}"
+            )
     return data
+
+
+NUMBER_NOISE_PATTERN = re.compile(r"[,\s￥¥$元]")
+TRUE_WORDS = {"是", "真", "有", "对", "y", "yes", "true", "t"}
+FALSE_WORDS = {"否", "假", "无", "错", "n", "no", "false", "f"}
+DATE_PATTERN = re.compile(r"(\d{4})\s*[年/\-.\s]\s*(\d{1,2})\s*[月/\-.\s]\s*(\d{1,2})\s*日?")
+
+
+def _to_number(value: Any) -> int | float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        return None
+    cleaned = NUMBER_NOISE_PATTERN.sub("", value)
+    if not cleaned:
+        return None
+    try:
+        number = float(cleaned)
+    except ValueError:
+        return None
+    if number.is_integer() and not re.search(r"[.eE]", cleaned):
+        return int(number)
+    return number
+
+
+def _to_boolean(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word in TRUE_WORDS or word == "1":
+            return True
+        if word in FALSE_WORDS or word == "0":
+            return False
+    return None
+
+
+def _to_iso_date(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text
+    match = DATE_PATTERN.fullmatch(text)
+    if not match:
+        return None
+    try:
+        return date(*(int(part) for part in match.groups())).isoformat()
+    except ValueError:
+        return None
+
+
+def coerce_field_types(data: dict[str, Any], fields: Sequence[TemplateField]) -> dict[str, Any]:
+    """把模型偶发写错的类型纠正回来，避免已经识别成功的数据因为格式被判失败。
+
+    实测 qwen 会把 number 字段写成 "100.00"，date 字段写成 "2026年9月3日"。值本身
+    是对的，Token 也花掉了，直接报 Invalid type 太浪费。这里只做无损转换：拿不准
+    的值原样保留，交给 validate_data 报错。
+    """
+    result = dict(data)
+    for field in fields:
+        key = getattr(field, "field_key", None)
+        if not key or result.get(key) is None:
+            continue
+        value = result[key]
+        field_type = getattr(field, "field_type", "text")
+        if field_type == "number":
+            converted = _to_number(value)
+        elif field_type == "boolean":
+            converted = _to_boolean(value)
+        elif field_type == "date":
+            converted = _to_iso_date(value)
+        elif field_type == "text":
+            converted = _to_text(value)
+        else:
+            converted = None
+        if converted is not None:
+            result[key] = converted
+    return result
+
+
+def _to_text(value: Any) -> str | None:
+    """身份证号之类被模型当成数字返回时，转回精确的文字。"""
+    if isinstance(value, str):
+        return None
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, (int, float)):
+        return str(value)
+    return None
 
 
 def claim_pending_batch() -> list[tuple[int, str]]:
@@ -172,22 +299,17 @@ def extract_with_model(document_id: int, claim_token: str, batch_started_at: flo
                 started_monotonic = time.monotonic()
                 try:
                     extraction = provider.extract(raw_text, field_data, source_path)
+                except ModelResponseError as error:
+                    # 返回格式跑偏（数组、字段清单、代码块等）带有随机性：同样的图片
+                    # 上一轮就是好的，所以格式错误单独重试一次，而不是立刻判失败。
+                    log_model_request_failure(document_id, attempt_number, error, request_started_at,
+                                              started_monotonic, will_retry=attempt == 0)
+                    if attempt == 0:
+                        continue
+                    raise
                 except Exception as error:
-                    request_completed_at = datetime.utcnow()
-                    duration_ms = round((time.monotonic() - started_monotonic) * 1000)
-                    with SessionLocal() as db:
-                        db.add(ProcessingLog(
-                            document_id=document_id,
-                            stage="ai",
-                            level="error",
-                            message=f"Model request failed (attempt {attempt_number}): {error}",
-                            attempt=attempt_number,
-                            request_started_at=request_started_at,
-                            request_completed_at=request_completed_at,
-                            duration_ms=duration_ms,
-                            response_json=getattr(error, "response_json", None),
-                        ))
-                        db.commit()
+                    log_model_request_failure(document_id, attempt_number, error, request_started_at,
+                                              started_monotonic, will_retry=False)
                     raise
                 usage = extraction.usage
                 request_completed_at = datetime.utcnow()
@@ -213,6 +335,7 @@ def extract_with_model(document_id: int, claim_token: str, batch_started_at: flo
             else:
                 data = {}
 
+            data = coerce_field_types(data, fields)
             data = calculate_template_fields(data, fields)
             validate_data(data, fields)
             invalid_ids = invalid_id_numbers(data)
@@ -360,6 +483,8 @@ def process_batch(claims: list[tuple[int, str]], ocr_executor: ThreadPoolExecuto
 
 
 def run():
+    # 上一轮可能异常退出，先把 WAL 折回主库，再开始领取任务。
+    checkpoint_sqlite()
     with ThreadPoolExecutor(max_workers=OCR_CONCURRENCY, thread_name_prefix="ocr") as ocr_executor:
         while True:
             resolve_duplicates()

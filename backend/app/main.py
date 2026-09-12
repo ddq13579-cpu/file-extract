@@ -1,26 +1,30 @@
 import hashlib
 import hmac
 import json
+import logging
 import mimetypes
 import re
 import uuid
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Annotated
+from typing import Annotated, Sequence
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 from sqlalchemy import inspect, select, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill
 
 from .config import AUTH_PASSWORD, AUTH_USERNAME, EXPORT_DIR, SECRET_KEY, SUPPORTED_EXTENSIONS, UPLOAD_DIR
-from .database import Base, engine, get_db
+from .database import Base, checkpoint_sqlite, engine, get_db
 from .models import Document, OCRResult, ProcessingLog, Record, Template, TemplateField
 from .schemas import LoginInput, RecordUpdate, TemplateImportInput, TemplateInput, TemplateOutput
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Document AI")
 
@@ -57,6 +61,8 @@ async def auth_middleware(request: Request, call_next):
 def startup():
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    # 上一次进程可能异常退出，先把 WAL 折回主库，再做建表与列迁移。
+    checkpoint_sqlite()
     Base.metadata.create_all(engine)
     with engine.connect() as conn:
         inspector = inspect(engine)
@@ -107,6 +113,28 @@ def startup():
             if name not in field_columns:
                 conn.execute(text(f"ALTER TABLE template_fields ADD COLUMN {name} {definition}"))
                 conn.commit()
+
+
+@app.exception_handler(SQLAlchemyError)
+async def database_error_handler(request: Request, exc: SQLAlchemyError):
+    """把底层数据库错误翻译成可读的中文提示。
+
+    SQLite 文件出问题时（历史上把库放在 Docker Desktop 的共享目录里会出现
+    "database disk image is malformed" / "disk I/O error"），接口只会返回
+    Internal Server Error，前端只能提示“删除任务失败”，完全无从排查。
+    """
+    logger.exception("Database error on %s %s", request.method, request.url.path, exc_info=exc)
+    message = str(getattr(exc, "orig", exc) or exc)
+    if "malformed" in message or "disk I/O error" in message:
+        detail = ("数据库文件读写异常（SQLite 报告文件损坏或磁盘 I/O 错误）。"
+                  "请先 docker compose down，再执行 bash scripts/db.sh repair，然后 docker compose up -d。")
+    elif "FOREIGN KEY constraint failed" in message:
+        detail = f"关联数据没能一并删除（数据库可能已损坏）：{message}"
+    elif "database is locked" in message or "database is busy" in message:
+        detail = "数据库正被其他进程占用，请稍后重试"
+    else:
+        detail = f"数据库操作失败：{message}"
+    return JSONResponse(status_code=503, content={"detail": detail})
 
 
 def template_or_404(template_id: int, db: Session) -> Template:
@@ -442,24 +470,58 @@ def download_document(document_id: int, db: Session = Depends(get_db)):
     return FileResponse(document.file_path, filename=document.filename, media_type=document.mime_type)
 
 
+def remove_uploaded_file(document: Document) -> None:
+    """删除任务独占的原文件，并顺手清掉随之变空的目录。
+
+    放在数据库事务提交之后调用：文件删不掉不应该让任务从库里消失不了。
+    目录结构是 uploads/<sha256 前 2 位>/<sha256>/<任务 uuid>/<文件名>。
+    """
+    upload_root = UPLOAD_DIR.resolve()
+    try:
+        file_path = Path(document.file_path).resolve()
+    except OSError:
+        return
+    if not file_path.is_relative_to(upload_root):
+        logger.warning("Refusing to unlink %s: outside the upload directory", document.file_path)
+        return
+    file_path.unlink(missing_ok=True)
+    for parent in (file_path.parent, file_path.parent.parent, file_path.parent.parent.parent):
+        if not parent.is_relative_to(upload_root) or parent == upload_root:
+            break
+        try:
+            parent.rmdir()
+        except OSError:  # 目录非空或被占用，保留即可
+            break
+
+
+def delete_document_rows(db: Session, document_ids: Sequence[int]) -> None:
+    """按外键顺序批量删除任务及其全部子表数据。
+
+    这里显式删子表，而不是依赖 ORM 级联：级联需要先把 ocr_results / records
+    SELECT 出来，数据库一旦出现坏页，删除就会以 "database disk image is
+    malformed" 或 "FOREIGN KEY constraint failed" 失败（前端只显示“删除任务
+    失败”）。批量 DELETE 省掉这次读取，顺序也完全确定，批量删除时还快得多。
+    """
+    ids = list(document_ids)
+    if not ids:
+        return
+    db.query(ProcessingLog).filter(ProcessingLog.document_id.in_(ids)).delete(synchronize_session=False)
+    db.query(Record).filter(Record.document_id.in_(ids)).delete(synchronize_session=False)
+    db.query(OCRResult).filter(OCRResult.document_id.in_(ids)).delete(synchronize_session=False)
+    db.query(Document).filter(Document.id.in_(ids)).delete(synchronize_session=False)
+    # 批量 DELETE 绕过了 identity map，清空会话，避免后续误用已不存在的对象。
+    db.expunge_all()
+
+
 @app.delete("/api/documents", status_code=200)
 def delete_all_documents(db: Session = Depends(get_db)):
     documents = db.scalars(select(Document)).all()
-    deleted_count = 0
-    skipped_count = 0
-    upload_root = UPLOAD_DIR.resolve()
-    for document in documents:
-        if document.status in {"processing", "ai_processing"}:
-            skipped_count += 1
-            continue
-        file_path = Path(document.file_path).resolve()
-        db.query(ProcessingLog).filter(ProcessingLog.document_id == document.id).delete()
-        db.delete(document)
-        deleted_count += 1
-        if file_path.is_relative_to(upload_root):
-            file_path.unlink(missing_ok=True)
+    deletable = [document for document in documents if document.status not in {"processing", "ai_processing"}]
+    delete_document_rows(db, [document.id for document in deletable])
     db.commit()
-    return {"deleted": deleted_count, "skipped": skipped_count}
+    for document in deletable:
+        remove_uploaded_file(document)
+    return {"deleted": len(deletable), "skipped": len(documents) - len(deletable)}
 
 
 @app.delete("/api/documents/{document_id}", status_code=204)
@@ -468,17 +530,11 @@ def delete_document(document_id: int, db: Session = Depends(get_db)):
     if not document:
         raise HTTPException(404, "Document not found")
     if document.status in {"processing", "ai_processing"}:
-        raise HTTPException(409, "A processing document cannot be deleted; retry after processing finishes")
+        raise HTTPException(409, "任务正在处理中，暂时不能删除；请等处理结束后重试")
 
-    file_path = Path(document.file_path).resolve()
-    upload_root = UPLOAD_DIR.resolve()
-    if not file_path.is_relative_to(upload_root):
-        raise HTTPException(500, "Document path is outside the upload directory")
-
-    db.query(ProcessingLog).filter(ProcessingLog.document_id == document_id).delete()
-    db.delete(document)
+    delete_document_rows(db, [document_id])
     db.commit()
-    file_path.unlink(missing_ok=True)
+    remove_uploaded_file(document)
     return None
 
 

@@ -25,40 +25,43 @@ docker compose ps
 docker compose logs -f worker
 ```
 
-停止服务：`docker compose down`。持久化数据在 [data/uploads](./data/uploads)、[data/database](./data/database) 和 [data/exports](./data/exports)。
+停止服务：`docker compose down`。上传的原文件在 [data/uploads](./data/uploads)、导出的 Excel 在 [data/exports](./data/exports)；**数据库在 Docker 命名卷 `ocr_database` 里**（容器内 `/data/database/app.db`），宿主机不能直接打开，用 `bash scripts/db.sh backup` 导出到 [data/backups](./data/backups)。
 
 ## 队列与 SQLite 配置
 
-- 上传文件以 SHA-256 内容地址保存，且每个任务独占一个子目录；同名不同内容、同内容多次上传都不会互相覆盖，删除任一任务也不会影响其他任务的原文件。
+- 上传文件以 SHA-256 内容地址保存，且每个任务独占一个子目录；同名不同内容、同内容多次上传都不会互相覆盖，删除任一任务也不会影响其他任务的原文件。删除任务时会一并删掉处理日志、结构化结果、OCR 文字和该任务独占的原文件与空目录。
 - Worker 每次最多领取 `WORKER_BATCH_SIZE`（默认 50）个任务。处理进程异常时，超过 `PROCESSING_LEASE_SECONDS`（默认 900 秒）的任务会安全回收并重试。
-- SQLite 默认启用 WAL 与 30 秒忙等待（`SQLITE_BUSY_TIMEOUT_SECONDS`）。单机小规模部署可保持此配置；需要多个 Worker 或更高并发时建议迁移 PostgreSQL。
+- SQLite 默认启用 WAL、30 秒忙等待（`SQLITE_BUSY_TIMEOUT_SECONDS`）和每 200 页自动 checkpoint；backend 与 worker 启动时都会先做一次 `wal_checkpoint(TRUNCATE)`。单机小规模部署可保持此配置；需要多个 Worker 或更高并发时建议迁移 PostgreSQL。
+- **数据库必须放在命名卷里，不能放回 `./data`**：Docker Desktop 的共享目录不支持 WAL 需要的 `-shm` 共享内存与跨容器锁，详见[数据库维护与故障排查](#数据库维护与故障排查)。
 
 ## 数据位置与模板迁移
 
-所有持久化数据都在宿主机的 [data](./data) 目录（`docker-compose.yml` 把 `./data` 挂载为容器内的 `/data`）：
+上传的原文件与导出结果在宿主机 [data](./data) 目录（`docker-compose.yml` 把 `./data` 挂载为容器内的 `/data`），数据库单独放在命名卷里：
 
 | 内容 | 位置 | 是否在 git 里 |
 | --- | --- | --- |
-| 模板与字段（`templates`、`template_fields`）、任务、OCR 文字、结构化结果、处理日志 | `data/database/app.db`（SQLite，由 `DATABASE_URL` 指定） | 否，`.gitignore` 忽略 |
+| 模板与字段（`templates`、`template_fields`）、任务、OCR 文字、结构化结果、处理日志 | 命名卷 `ocr_database`（容器内 `/data/database/app.db`，由 `DATABASE_URL` 指定） | 否 |
+| 数据库备份 | `data/backups/`（由 `bash scripts/db.sh backup` 生成） | 否，`.gitignore` 忽略 |
 | 上传的原文件 | `data/uploads/` | 否 |
 | 导出的 Excel | `data/exports/` | 否 |
 | 模板 JSON 备份 | 浏览器从“模板管理”导出的 JSON 文件 | 可按需提交 |
 
 模板没有单独的文件，全部存在 `app.db` 的 `templates` + `template_fields` 两张表里，所以**换机器时只 `git clone` 是拿不到模板的**，必须把数据带过去。有三种做法：
 
-### 方式一：整体搬迁 data 目录（模板 + 任务 + 结果全部带走）
+### 方式一：整体搬迁（模板 + 任务 + 结果全部带走）
 
 ```bash
-docker compose down                                       # 先停服务，避免复制到写了一半的库
+# 旧机器：先把命名卷里的库导出到 ./data/backups（在线备份，不用停服）
+bash scripts/db.sh backup                      # 生成 data/backups/app-<时间戳>.db
 rsync -av --progress data/ 用户@新机器:/路径/OCR云项目/data/   # 或者直接拷 U 盘
-# 新机器：拉代码、放好 .env，再 docker compose up -d --build
+
+# 新机器：拉代码、放好 .env，构建镜像后把备份灌回命名卷
+docker compose build
+bash scripts/db.sh restore /data/backups/app-<时间戳>.db
+docker compose up -d
 ```
 
-SQLite 开了 WAL，除 `app.db` 外还有 `app.db-wal`、`app.db-shm`。停服后再复制最保险；服务还在跑时先合并一次 WAL：
-
-```bash
-docker compose exec backend python -c "import sqlite3;c=sqlite3.connect('/data/database/app.db');c.execute('PRAGMA wal_checkpoint(TRUNCATE)');c.close()"
-```
+`db.sh backup` 用的是 SQLite 在线备份 API，拿到的是一致快照，不需要先合并 WAL。
 
 ### 方式二：只搬模板（推荐，跨机器最稳）
 
@@ -81,6 +84,45 @@ docker compose exec backend python -c "import sqlite3;c=sqlite3.connect('/data/d
 
 上传按 SHA-256 识别重复文件，但**不再跳过**：重复文件同样会建立独立任务、出现在“处理结果”并参与导出，只是直接复用最早那份相同文件的 OCR 文字与提取结果（先处于 `duplicate_waiting` 状态，复用成功后置为 `completed`，不再调用 OCR 和模型，不消耗 Token）。“处理结果”表格用橙色“重复文件”标记提示，悬停可看到与哪个文件重复；处理日志会写入一条 `duplicate` 记录；导出的 Excel 追加 `是否重复文件`、`重复源文件` 两列，并给重复行加浅黄底色。若源任务没有可复用结果（已删除、失败，或使用的是其他模板），该重复任务会自动回退为完整重新处理，重复标记保留。仅支持 PDF、JPG/JPEG、PNG、WEBP、BMP、TIF/TIFF、HEIC；其他文件会跳过。所有原始文件只经受控 API 访问，上传路径会拒绝路径穿越。
 
+## 数据库维护与故障排查
+
+数据库在命名卷 `ocr_database` 里，宿主机看不到文件，统一用 [scripts/db.sh](./scripts/db.sh) 操作（它把 [scripts/db_tool.py](./scripts/db_tool.py) 通过标准输入送进容器执行，只用 Python 标准库）：
+
+| 命令 | 作用 | 是否需要停服 |
+| --- | --- | --- |
+| `bash scripts/db.sh status` | 完整性检查、外键检查、各表行数、WAL 大小 | 否 |
+| `bash scripts/db.sh backup [目标文件]` | 在线备份到 `data/backups/app-<时间戳>.db` | 否 |
+| `bash scripts/db.sh repair` | 先快照原始文件，再 checkpoint + 校验，必要时用 SQL dump 重建 | 是，先 `docker compose down` |
+| `bash scripts/db.sh restore <备份文件>` | 整库恢复，当前库会被移开保存 | 是，先 `docker compose down` |
+
+**为什么数据库不放在 `./data` 里？** macOS/Windows 的 Docker Desktop 用 virtiofs / gRPC-FUSE 共享目录，不支持 SQLite WAL 需要的 `-shm` 共享内存映射与跨容器 POSIX 锁。库放在 `./data/database` 时，worker 提交结果会随机报 `disk I/O error`，之后 backend 读到不一致的 WAL 索引就报 `database disk image is malformed`；这时“删除任务”因为级联的子表读不出来而失败（`FOREIGN KEY constraint failed`），接口返回 500，前端只能提示“删除任务失败”。`docker-compose.yml` 里 `database:/data/database` 这条挂载点更深，会覆盖 `./data` 中的同名目录，把库落到虚拟机内部的 ext4 上，`uploads` 与 `exports` 仍在宿主机。
+
+再遇到这类报错：
+
+1. `docker compose down`
+2. `bash scripts/db.sh repair`（原始文件先快照到 `data/backups/raw/`，修复失败不会丢数据）
+3. `docker compose up -d`
+4. 仍不行就 `bash scripts/db.sh restore /data/backups/<最近的备份>.db`
+
+接口层面也做了兜底：数据库异常不再返回笼统的 `Internal Server Error`，而是 503 加上中文原因和修复指引，前端会直接显示出来。
+
+另外：**不要在服务运行时从 macOS 侧用 `sqlite3` 命令或 DB Browser 直接打开库文件**，宿主机和容器各有一份页缓存，同样会把 WAL 弄成不一致状态。要看数据就先 `bash scripts/db.sh backup`，再打开导出的那份副本。
+
 ## 依赖说明
 
 Worker 保持 PDF 与图片分流：PDF 使用 PyMuPDF 提取文字后，通过 OpenAI 兼容接口提取结构化结果；图片直接以本地文件的 Base64 data URL 提交给同一个支持视觉输入的模型完成识别和结构化提取。服务地址、模型名和密钥分别由 `BASE_URL`、`MODEL`、`API_KEY` 配置，只从环境变量读取，可替换为任意 OpenAI 兼容的服务商；模型请求并发数由 `AI_CONCURRENCY` 配置。每个请求的实际模型和 SDK 返回的输入、输出、总 Token 会写入 `processing_logs`。结构化结果包含大陆身份证号时，会校验末位校验码；校验失败会完整重识别一次，仍失败则任务报错。HEIC 图片会在内存中转换为 PNG，以保持既有支持的上传格式。
+
+### 模型返回的容错
+
+即使请求带了 `response_format={"type": "json_object"}`，模型仍会偶发跑偏。下面是实测遇到过的几种情况和对应处理，原则是**能救就救，别把已经花掉 Token 的结果扔掉**：
+
+| 模型实际返回 | 处理方式 |
+| --- | --- |
+| `[{"field_1": ..., ...}]`（正确对象被裹进单元素数组） | 自动脱壳 |
+| `[{"field_key": "field_1", "value": ...}, ...]`（字段清单写法） | 自动压平成对象 |
+| ` ```json ... ``` `（Markdown 代码块包裹） | 自动去掉围栏 |
+| number 字段返回 `"100.00"`、date 字段返回 `2026年9月3日`、boolean 返回 `是/否` | 无损纠正为正确类型（`100.0`、`2026-09-03`、`true`） |
+| 以上都还原不出来 | 记一条日志（含模型原始返回）后**重试一次**，仍失败才把任务标记为 failed |
+
+提示词里也写死了返回骨架示例（键取自模板字段），实测能把跑偏概率压到很低。任务的 `error_message` 会写明确原因，处理日志的 `response_json` 保存模型原始返回，可直接用于排查；类型对不上时会报出期望类型和实际值，字段不匹配时会列出缺失和多余的 `field_key`。
+

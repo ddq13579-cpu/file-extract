@@ -10,6 +10,8 @@ data/uploads/*
 !data/uploads/.gitkeep
 data/database/*
 !data/database/.gitkeep
+data/backups/*
+!data/backups/.gitkeep
 data/exports/*
 !data/exports/.gitkeep
 
