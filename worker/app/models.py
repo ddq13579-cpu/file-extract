@@ -24,6 +24,12 @@ class Document(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class Template(Base):
+    __tablename__ = "templates"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+
+
 class TemplateField(Base):
     __tablename__ = "template_fields"
     id: Mapped[int] = mapped_column(primary_key=True)
